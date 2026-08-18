@@ -1,0 +1,39 @@
+name: XAU Signal Scan
+
+on:
+  schedule:
+    # Roughly 7am-4pm PKT (2:00-11:59 UTC) - script double-checks exact window
+    - cron: "*/5 2-11 * * *"
+    # Roughly 8pm-11pm PKT (15:00-18:59 UTC) - script double-checks exact window
+    - cron: "*/5 15-18 * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python xau_bot.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "xau-scanner-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --quiet --cached || git commit -m "Update signal state [skip ci]"
+          git push
