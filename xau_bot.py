@@ -245,7 +245,7 @@ def in_session_window(now_utc):
 
 
 # ============================= SIGNAL ENGINE =============================
-def evaluate(candles5, candles15, candles30, candles60, now_utc):
+def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=False):
     if len(candles5) < 60 or len(candles15) < 40 or len(candles30) < 30 or len(candles60) < 20:
         return {"state": "WARMING_UP"}
 
@@ -278,12 +278,16 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc):
     div15 = detect_divergence(candles15, rsi15)
     div30 = detect_divergence(candles30, rsi30)
 
-    in_session = in_session_window(now_utc)
+    real_in_session = in_session_window(now_utc)
+    in_session = real_in_session or bypass_session
     ma_proximity = ma21 is not None and abs(price - ma21) <= FAST_MA_PROXIMITY_USD
 
     def eval_side(direction):
         conds = []
-        conds.append(("session", "Within trading session (7am-4pm or 8pm-11pm PKT)", in_session))
+        session_label = "Within trading session (7am-4pm or 8pm-11pm PKT)"
+        if bypass_session and not real_in_session:
+            session_label += " [bypassed for demo run]"
+        conds.append(("session", session_label, in_session))
         conds.append(("ma_proximity", f"21MA(5m) within ${FAST_MA_PROXIMITY_USD} of price", ma_proximity))
 
         relevant = ([("5m", tl5dn, len(candles5)), ("15m", tl15dn, len(candles15)), ("30m", tl30dn, len(candles30))]
@@ -413,8 +417,9 @@ def save_state(state):
 # ============================= MAIN =============================
 def main():
     now_utc = datetime.now(timezone.utc)
+    is_manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
-    if not in_session_window(now_utc):
+    if not in_session_window(now_utc) and not is_manual_run:
         print("Outside trading session window (PKT). Skipping this run.")
         return
 
@@ -430,12 +435,29 @@ def main():
     candles30 = build_candles(points, 30)
     candles60 = build_candles(points, 60)
 
-    res = evaluate(candles5, candles15, candles30, candles60, now_utc)
+    res = evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=is_manual_run)
     print("Evaluated state:", res.get("state"), "| spot:", spot.get("spot_usd_oz"))
+
+    if res.get("state") == "WARMING_UP":
+        if is_manual_run:
+            send_telegram("⏳ Demo run: still building candle history from live ticks — "
+                           "try again in a few minutes once more data has accumulated.")
+        print("Still warming up, not enough candle history yet.")
+        return
 
     state_store = load_state()
     last_state = state_store.get("last_state", "NONE")
     current_state = res.get("state")
+
+    if is_manual_run:
+        # Manual/demo run: always send a status message so you can confirm Telegram delivery,
+        # regardless of whether the state actually changed.
+        prefix = "🧪 <b>Demo run</b>\n\n" if current_state == "NO_TRADE" else ""
+        send_telegram(prefix + build_message(res) if current_state != "NO_TRADE" else
+                      prefix + f"Price: ${fmt(res['price'])}\nConditions met: {res['passed']}/{res['total']}\n\n" +
+                      "\n".join(f"{'✅' if p else '▫️'} {label}" for _, label, p in res["conds"]))
+        print("Manual run: notification sent regardless of state change.")
+        return
 
     if current_state in ("BUY", "SELL", "PRE_BUY", "PRE_SELL") and current_state != last_state:
         send_telegram(build_message(res))
