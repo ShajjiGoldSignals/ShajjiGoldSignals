@@ -22,12 +22,16 @@ RSI_PERIOD = 14
 MA_PERIODS = [21, 50, 200]
 FAST_MA_PROXIMITY_USD = 5
 MIN_BREAK_USD = 5
-LINE_DEVIATION_USD = 3
-SR_DEVIATION_USD = 5
+LINE_DEVIATION_USD = 3          # trendline touch tolerance (for line validity itself)
+TRENDLINE_RETEST_DEVIATION_USD = 2  # looser tolerance just for confirming a retest touch
+SR_DEVIATION_USD = 5            # support/resistance touch tolerance AND retest tolerance
 SWING_LOOKBACK = 5
 RISK_REWARD = 1
-PRE_SIGNAL_MIN_CONDITIONS = 4   # fire a pre-signal once at least this many of the 6 conditions are met
-FULL_SIGNAL_MIN_CONDITIONS = 5  # fire a full BUY/SELL once at least this many (up to all 6) are met
+PRE_SIGNAL_MIN_CONDITIONS = 4   # fire a pre-signal once at least this many of the 8 conditions are met
+FULL_SIGNAL_MIN_CONDITIONS = 6  # fire a full BUY/SELL once at least this many (up to all 8) are met
+# a trendline must be built from swing touches within this many recent candles per timeframe
+TRENDLINE_RECENCY_CANDLES = {5: 20, 15: 50, 30: 50}
+MAX_LINE_DISTANCE_USD = 30  # a trendline projecting further than this from current price is treated as stale/unreliable
 # session windows in PKT: (start_hour,start_min,end_hour,end_min)
 SESSION_WINDOWS = [(7, 0, 16, 0), (20, 0, 23, 0)]
 
@@ -123,6 +127,7 @@ def rsi_series(closes, period):
 
 
 def atr(candles, period):
+    """Wilder's smoothed ATR - matches MT5's built-in ATR indicator (not a plain average)."""
     if len(candles) < period + 1:
         return None
     trs = []
@@ -130,8 +135,12 @@ def atr(candles, period):
         cur, prev = candles[i], candles[i - 1]
         tr = max(cur["h"] - cur["l"], abs(cur["h"] - prev["c"]), abs(cur["l"] - prev["c"]))
         trs.append(tr)
-    tail = trs[-period:]
-    return sum(tail) / len(tail)
+    if len(trs) < period:
+        return None
+    atr_val = sum(trs[:period]) / period  # seed value: simple average of first `period` TRs
+    for tr in trs[period:]:
+        atr_val = (atr_val * (period - 1) + tr) / period  # Wilder's running smoothing
+    return atr_val
 
 
 # ============================= SWINGS =============================
@@ -149,6 +158,12 @@ def find_swings(candles, lookback):
 
 
 # ============================= TRENDLINES =============================
+def recent_swings(swings, total_candles, window):
+    """Only keep swing points from within the last `window` candles."""
+    cutoff = total_candles - window
+    return [s for s in swings if s["i"] >= cutoff]
+
+
 def detect_trendline(swings, min_touches, deviation):
     if len(swings) < 3:
         return None
@@ -163,12 +178,29 @@ def detect_trendline(swings, min_touches, deviation):
             intercept = p1["price"] - slope * p1["i"]
             touches = sum(1 for p in pts if abs(p["price"] - (slope * p["i"] + intercept)) <= deviation)
             if touches >= min_touches and (best is None or touches > best["touches"]):
-                best = {"slope": slope, "intercept": intercept, "touches": touches}
+                best = {"slope": slope, "intercept": intercept, "touches": touches,
+                        "last_touch_i": max(p1["i"], p2["i"])}
     return best
 
 
 def line_value_at(line, idx):
     return line["slope"] * idx + line["intercept"]
+
+
+def retest_touch_found(candles, level_at, deviation, lookback=10):
+    """Check the recent candles (excluding the very latest, which is the break/rejection
+    candle itself) for a genuine touch back to the line/level — i.e. price actually came
+    back and interacted with it after breaking, not just currently sitting past it."""
+    start = max(0, len(candles) - lookback)
+    end = len(candles) - 1  # exclude the current/last candle
+    for i in range(start, end):
+        level = level_at(i)
+        if level is None:
+            continue
+        c = candles[i]
+        if (c["l"] - deviation) <= level <= (c["h"] + deviation):
+            return True
+    return False
 
 
 # ============================= SUPPORT / RESISTANCE (1h) =============================
@@ -265,9 +297,19 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
     sw15h, sw15l = find_swings(candles15, SWING_LOOKBACK)
     sw30h, sw30l = find_swings(candles30, SWING_LOOKBACK)
 
-    tl5up, tl5dn = detect_trendline(sw5h, 2, LINE_DEVIATION_USD), detect_trendline(sw5l, 2, LINE_DEVIATION_USD)
-    tl15up, tl15dn = detect_trendline(sw15h, 2, LINE_DEVIATION_USD), detect_trendline(sw15l, 2, LINE_DEVIATION_USD)
-    tl30up, tl30dn = detect_trendline(sw30h, 2, LINE_DEVIATION_USD), detect_trendline(sw30l, 2, LINE_DEVIATION_USD)
+    # only use touches from the recent window per timeframe (matches original spec:
+    # 5m -> last 20 candles, 15m/30m -> last 50 candles) so lines can't be built from
+    # swings hours old and extrapolated forward into a stale, unrealistic value.
+    sw5h_r = recent_swings(sw5h, len(candles5), TRENDLINE_RECENCY_CANDLES[5])
+    sw5l_r = recent_swings(sw5l, len(candles5), TRENDLINE_RECENCY_CANDLES[5])
+    sw15h_r = recent_swings(sw15h, len(candles15), TRENDLINE_RECENCY_CANDLES[15])
+    sw15l_r = recent_swings(sw15l, len(candles15), TRENDLINE_RECENCY_CANDLES[15])
+    sw30h_r = recent_swings(sw30h, len(candles30), TRENDLINE_RECENCY_CANDLES[30])
+    sw30l_r = recent_swings(sw30l, len(candles30), TRENDLINE_RECENCY_CANDLES[30])
+
+    tl5up, tl5dn = detect_trendline(sw5h_r, 3, LINE_DEVIATION_USD), detect_trendline(sw5l_r, 3, LINE_DEVIATION_USD)
+    tl15up, tl15dn = detect_trendline(sw15h_r, 3, LINE_DEVIATION_USD), detect_trendline(sw15l_r, 3, LINE_DEVIATION_USD)
+    tl30up, tl30dn = detect_trendline(sw30h_r, 3, LINE_DEVIATION_USD), detect_trendline(sw30l_r, 3, LINE_DEVIATION_USD)
 
     res_clusters, sup_clusters = detect_sr(candles60, SR_DEVIATION_USD)
     resistances = [c["avg"] for c in res_clusters]
@@ -292,27 +334,49 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
         conds.append(("session", session_label, in_session))
         conds.append(("ma_proximity", f"21MA(5m) within ${FAST_MA_PROXIMITY_USD} of price", ma_proximity))
 
-        relevant = ([("5m", tl5dn, len(candles5)), ("15m", tl15dn, len(candles15)), ("30m", tl30dn, len(candles30))]
+        relevant = ([("5m", tl5dn, candles5), ("15m", tl15dn, candles15), ("30m", tl30dn, candles30)]
                     if direction == "buy" else
-                    [("5m", tl5up, len(candles5)), ("15m", tl15up, len(candles15)), ("30m", tl30up, len(candles30))])
-        tl_pass, tl_desc = False, "No valid trendline break+retest found"
-        for tf, line, last_len in relevant:
+                    [("5m", tl5up, candles5), ("15m", tl15up, candles15), ("30m", tl30up, candles30)])
+        tl_break_pass, tl_break_desc = False, "No valid trendline break found"
+        tl_retest_pass, tl_retest_desc = False, "No trendline retest to confirm (no break yet)"
+        for tf, line, cands in relevant:
             if not line:
                 continue
+            last_len = len(cands)
             line_now = line_value_at(line, last_len - 1)
+            if abs(line_now - price) > MAX_LINE_DISTANCE_USD:
+                continue  # projection too far from current price to be a reliable/relevant line
             broke = (price > line_now + MIN_BREAK_USD) if direction == "buy" else (price < line_now - MIN_BREAK_USD)
-            if broke:
-                tl_pass = True
-                tl_desc = f"Trendline break+retest confirmed on {tf} (line ~${line_now:.2f})"
-                break
-        conds.append(("trendline", tl_desc, tl_pass))
+            if not broke:
+                continue
+            tl_break_pass = True
+            tl_break_desc = f"Trendline break confirmed on {tf} (line ~${line_now:.2f})"
+            retested = retest_touch_found(cands, lambda i, ln=line: line_value_at(ln, i), TRENDLINE_RETEST_DEVIATION_USD)
+            if retested:
+                tl_retest_pass = True
+                tl_retest_desc = f"Trendline retest confirmed on {tf} (within ${TRENDLINE_RETEST_DEVIATION_USD})"
+            else:
+                tl_retest_desc = f"Trendline broke on {tf} but no retest touch yet"
+            break  # use the first qualifying timeframe's break/retest pair together
+        conds.append(("trendline_break", tl_break_desc, tl_break_pass))
+        conds.append(("trendline_retest", tl_retest_desc, tl_retest_pass))
 
-        sr_pass, sr_desc = False, "No 1H support/resistance break+retest found"
+        sr_break_pass, sr_break_desc = False, "No 1H support/resistance break found"
+        sr_retest_pass, sr_retest_desc = False, "No 1H retest to confirm (no break yet)"
+        sr_level = None
         if direction == "buy" and nearest_res is not None and price > nearest_res + MIN_BREAK_USD:
-            sr_pass, sr_desc = True, f"1H resistance ~${nearest_res:.2f} broken + retested"
+            sr_level = nearest_res
+            sr_break_pass, sr_break_desc = True, f"1H resistance ~${nearest_res:.2f} broken"
         if direction == "sell" and nearest_sup is not None and price < nearest_sup - MIN_BREAK_USD:
-            sr_pass, sr_desc = True, f"1H support ~${nearest_sup:.2f} broken + retested"
-        conds.append(("sr", sr_desc, sr_pass))
+            sr_level = nearest_sup
+            sr_break_pass, sr_break_desc = True, f"1H support ~${nearest_sup:.2f} broken"
+        if sr_break_pass:
+            if retest_touch_found(candles60, lambda i: sr_level, SR_DEVIATION_USD):
+                sr_retest_pass, sr_retest_desc = True, f"1H level ~${sr_level:.2f} retested (within ${SR_DEVIATION_USD})"
+            else:
+                sr_retest_desc = f"1H level ~${sr_level:.2f} broke but no retest touch yet"
+        conds.append(("sr_break", sr_break_desc, sr_break_pass))
+        conds.append(("sr_retest", sr_retest_desc, sr_retest_pass))
 
         want_rev = "up" if direction == "buy" else "down"
         strike_match = strike_type is not None and strike_rev == want_rev
@@ -402,76 +466,4 @@ def build_message(res):
     return "\n".join(lines)
 
 
-# ============================= STATE PERSISTENCE =============================
-def load_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {"last_state": "NONE"}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-# ============================= MAIN =============================
-def main():
-    now_utc = datetime.now(timezone.utc)
-    is_manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-
-    if not in_session_window(now_utc) and not is_manual_run:
-        print("Outside trading session window (PKT). Skipping this run.")
-        return
-
-    try:
-        points = fetch_intraday()
-        spot = fetch_spot()
-    except Exception as e:
-        print("Data fetch failed:", e)
-        sys.exit(0)  # don't fail the workflow on a transient API hiccup
-
-    candles5 = build_candles(points, 5)
-    candles15 = build_candles(points, 15)
-    candles30 = build_candles(points, 30)
-    candles60 = build_candles(points, 60)
-
-    res = evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=is_manual_run)
-    print("Evaluated state:", res.get("state"), "| spot:", spot.get("spot_usd_oz"))
-
-    if res.get("state") == "WARMING_UP":
-        if is_manual_run:
-            send_telegram("⏳ Demo run: still building candle history from live ticks — "
-                           "try again in a few minutes once more data has accumulated.")
-        print("Still warming up, not enough candle history yet.")
-        return
-
-    state_store = load_state()
-    last_state = state_store.get("last_state", "NONE")
-    current_state = res.get("state")
-
-    if is_manual_run:
-        # Manual/demo run: always send a status message so you can confirm Telegram delivery,
-        # regardless of whether the state actually changed.
-        prefix = "🧪 <b>Demo run</b>\n\n" if current_state == "NO_TRADE" else ""
-        send_telegram(prefix + build_message(res) if current_state != "NO_TRADE" else
-                      prefix + f"Price: ${fmt(res['price'])}\nConditions met: {res['passed']}/{res['total']}\n\n" +
-                      "\n".join(f"{'✅' if p else '▫️'} {label}" for _, label, p in res["conds"]))
-        print("Manual run: notification sent regardless of state change.")
-        return
-
-    if current_state in ("BUY", "SELL", "PRE_BUY", "PRE_SELL") and current_state != last_state:
-        send_telegram(build_message(res))
-        state_store["last_state"] = current_state
-        state_store["last_signal_time"] = now_utc.isoformat()
-        save_state(state_store)
-    elif current_state == "NO_TRADE" and last_state != "NONE":
-        state_store["last_state"] = "NONE"
-        save_state(state_store)
-    else:
-        print("No state change, no notification sent.")
-
-
-if __name__ == "__main__":
-    main()
+def build_confirmed_signal_message(res, signal_number, tp_hits, sl_hi
