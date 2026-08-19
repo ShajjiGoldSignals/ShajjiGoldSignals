@@ -466,4 +466,174 @@ def build_message(res):
     return "\n".join(lines)
 
 
-def build_confirmed_signal_message(res, signal_number, tp_hits, sl_hi
+def build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits):
+    """Message for a CONFIRMED (not pre-) BUY/SELL, including its signal number and
+    the running TP/SL tally as it stood *before* this trade resolves."""
+    emoji = "🟢" if res["state"] == "BUY" else "🔴"
+    lines = [f"{emoji} <b>XAU {res['state']} SIGNAL — Signal #{signal_number}</b>",
+             f"(so far: TP hit: {tp_hits}, SL hit: {sl_hits})",
+             "",
+             f"Price: ${fmt(res['price'])}",
+             f"Entry: ${fmt(res['entry'])} | SL: ${fmt(res['sl'])} | TP: ${fmt(res['tp'])}",
+             f"Conditions met: {res['passed']}/{res['total']}",
+             ""]
+    for _, label, passed in res["conds"]:
+        lines.append(f"{'✅' if passed else '▫️'} {label}")
+    return "\n".join(lines)
+
+
+def build_outcome_message(trade, outcome, tp_hits, sl_hits):
+    result = "✅ TP HIT" if outcome == "TP" else "❌ SL HIT"
+    return "\n".join([
+        f"📊 <b>Signal #{trade['signal_number']} result: {result}</b>",
+        f"{trade['dir']} | Entry ${fmt(trade['entry'])} | SL ${fmt(trade['sl'])} | TP ${fmt(trade['tp'])}",
+        f"Running total — TP hit: {tp_hits}, SL hit: {sl_hits}",
+    ])
+
+
+# ============================= TRADE OUTCOME TRACKING =============================
+def resolve_trade(trade, candles5):
+    """Walk candles chronologically after the trade opened to see whether TP or SL was
+    hit first. If a single candle's range covers both levels (ambiguous intrabar path),
+    conservatively counts it as SL hit rather than assuming the best case."""
+    opened_ms = trade["opened_at_ms"]
+    direction = trade["dir"]
+    tp, sl = trade["tp"], trade["sl"]
+    for c in candles5:
+        if c["t"] <= opened_ms:
+            continue
+        if direction == "BUY":
+            hit_tp, hit_sl = c["h"] >= tp, c["l"] <= sl
+        else:
+            hit_tp, hit_sl = c["l"] <= tp, c["h"] >= sl
+        if hit_tp and hit_sl:
+            return "SL"
+        if hit_tp:
+            return "TP"
+        if hit_sl:
+            return "SL"
+    return None  # not resolved yet
+
+
+def process_pending_trades(candles5, state_store):
+    pending = state_store.get("pending_trades", [])
+    still_pending = []
+    for trade in pending:
+        outcome = resolve_trade(trade, candles5)
+        if outcome is None:
+            still_pending.append(trade)
+            continue
+        if outcome == "TP":
+            state_store["tp_hits"] = state_store.get("tp_hits", 0) + 1
+        else:
+            state_store["sl_hits"] = state_store.get("sl_hits", 0) + 1
+        send_telegram(build_outcome_message(trade, outcome, state_store.get("tp_hits", 0), state_store.get("sl_hits", 0)))
+    state_store["pending_trades"] = still_pending
+
+
+# ============================= STATE PERSISTENCE =============================
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data.setdefault("last_state", "NONE")
+    data.setdefault("signal_counter", 0)
+    data.setdefault("tp_hits", 0)
+    data.setdefault("sl_hits", 0)
+    data.setdefault("pending_trades", [])
+    return data
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# ============================= MAIN =============================
+def main():
+    now_utc = datetime.now(timezone.utc)
+    is_manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+    if not in_session_window(now_utc) and not is_manual_run:
+        print("Outside trading session window (PKT). Skipping this run.")
+        return
+
+    try:
+        points = fetch_intraday()
+        spot = fetch_spot()
+    except Exception as e:
+        print("Data fetch failed:", e)
+        sys.exit(0)  # don't fail the workflow on a transient API hiccup
+
+    candles5 = build_candles(points, 5)
+    candles15 = build_candles(points, 15)
+    candles30 = build_candles(points, 30)
+    candles60 = build_candles(points, 60)
+
+    res = evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=is_manual_run)
+    print("Evaluated state:", res.get("state"), "| spot:", spot.get("spot_usd_oz"))
+
+    if res.get("state") == "WARMING_UP":
+        if is_manual_run:
+            send_telegram("⏳ Demo run: still building candle history from live ticks — "
+                           "try again in a few minutes once more data has accumulated.")
+        print("Still warming up, not enough candle history yet.")
+        return
+
+    state_store = load_state()
+
+    # Check any open confirmed signals for TP/SL resolution first, regardless of current state.
+    if not is_manual_run:
+        process_pending_trades(candles5, state_store)
+
+    last_state = state_store.get("last_state", "NONE")
+    current_state = res.get("state")
+
+    if is_manual_run:
+        # Manual/demo run: always send a status message so you can confirm Telegram delivery,
+        # regardless of whether the state actually changed. Demo runs do NOT register signals
+        # or affect the TP/SL tally, so testing never pollutes your real track record.
+        prefix = "🧪 <b>Demo run</b>\n\n" if current_state == "NO_TRADE" else ""
+        send_telegram(prefix + build_message(res) if current_state != "NO_TRADE" else
+                      prefix + f"Price: ${fmt(res['price'])}\nConditions met: {res['passed']}/{res['total']}\n\n" +
+                      "\n".join(f"{'✅' if p else '▫️'} {label}" for _, label, p in res["conds"]))
+        print("Manual run: notification sent regardless of state change.")
+        return
+
+    if current_state in ("BUY", "SELL") and current_state != last_state:
+        # Confirmed signal: assign a signal number, send with the running tally, and track it
+        # so a future run can detect whether it hit TP or SL.
+        tp_hits, sl_hits = state_store.get("tp_hits", 0), state_store.get("sl_hits", 0)
+        signal_number = state_store.get("signal_counter", 0) + 1
+        state_store["signal_counter"] = signal_number
+
+        send_telegram(build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits))
+
+        state_store.setdefault("pending_trades", []).append({
+            "signal_number": signal_number, "dir": current_state,
+            "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
+            "opened_at_ms": int(now_utc.timestamp() * 1000),
+        })
+        state_store["last_state"] = current_state
+        state_store["last_signal_time"] = now_utc.isoformat()
+        save_state(state_store)
+
+    elif current_state in ("PRE_BUY", "PRE_SELL") and current_state != last_state:
+        # Pre-signals are informational only - not numbered, not tracked for TP/SL.
+        send_telegram(build_message(res))
+        state_store["last_state"] = current_state
+        save_state(state_store)
+
+    elif current_state == "NO_TRADE" and last_state != "NONE":
+        state_store["last_state"] = "NONE"
+        save_state(state_store)
+
+    else:
+        print("No state change, no notification sent.")
+        save_state(state_store)  # still persist any pending-trade resolutions from above
+
+
+if __name__ == "__main__":
+    main()
