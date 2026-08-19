@@ -1,4 +1,8 @@
 {
   "last_state": "NONE",
-  "last_signal_time": "2026-08-19T09:28:17.498235+00:00"
+  "last_signal_time": "2026-08-19T09:28:17.498235+00:00",
+  "signal_counter": 0,
+  "tp_hits": 0,
+  "sl_hits": 0,
+  "pending_trades": []
 }
