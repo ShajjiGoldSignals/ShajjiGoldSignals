@@ -26,6 +26,8 @@ LINE_DEVIATION_USD = 3
 SR_DEVIATION_USD = 5
 SWING_LOOKBACK = 5
 RISK_REWARD = 1
+PRE_SIGNAL_MIN_CONDITIONS = 4   # fire a pre-signal once at least this many of the 6 conditions are met
+FULL_SIGNAL_MIN_CONDITIONS = 5  # fire a full BUY/SELL once at least this many (up to all 6) are met
 # session windows in PKT: (start_hour,start_min,end_hour,end_min)
 SESSION_WINDOWS = [(7, 0, 16, 0), (20, 0, 23, 0)]
 
@@ -330,7 +332,7 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
         total = len(conds)
         return {
             "dir": direction, "conds": conds, "passed": passed, "total": total,
-            "all_pass": passed == total, "nearly_all": passed >= total - 1,
+            "all_pass": passed >= FULL_SIGNAL_MIN_CONDITIONS, "nearly_all": passed >= PRE_SIGNAL_MIN_CONDITIONS,
         }
 
     buy_side, sell_side = eval_side("buy"), eval_side("sell")
