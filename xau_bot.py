@@ -27,10 +27,19 @@ TRENDLINE_RETEST_DEVIATION_USD = 2  # looser tolerance just for confirming a ret
 SR_DEVIATION_USD = 5            # support/resistance touch tolerance AND retest tolerance
 SWING_LOOKBACK = 5
 RISK_REWARD = 1
-PRE_SIGNAL_MIN_CONDITIONS = 4   # fire a pre-signal once at least this many of the 8 conditions are met
-FULL_SIGNAL_MIN_CONDITIONS = 6  # fire a full BUY/SELL once at least this many (up to all 8) are met
+PRE_SIGNAL_MIN_CONDITIONS = 4   # fire a pre-signal once at least this many of the 6 CORE conditions are met
+FULL_SIGNAL_MIN_CONDITIONS = 6  # full signal needs all 6 core, OR 5/6 core + at least 1 confluence bonus
 # a trendline must be built from swing touches within this many recent candles per timeframe
-TRENDLINE_RECENCY_CANDLES = {5: 20, 15: 50, 30: 50}
+TRENDLINE_RECENCY_CANDLES = {5: 150, 15: 190, 30: 96, 60: 48}
+MIN_TRENDLINE_TOUCHES = 3            # minimum gate; bounce magnitude is the real differentiator
+MIN_TRENDLINE_SPAN_CANDLES = 15      # touches must be spread out, not bunched together
+MAX_TRENDLINE_SLOPE_USD_PER_CANDLE = 3.0  # reject near-vertical lines (unsustainable moves)
+# --- 5m entry-line liveness (ATR-scaled so it adapts to volatility) ---
+LINE_MAX_DISTANCE_ATR = 8.0          # line must project within 8x ATR of current price
+LINE_ACTIVITY_WINDOW_CANDLES = 100   # last touch/break must be within this many candles
+LINE_SPENT_ATR = 4.0                 # if price ever went >4x ATR beyond the line, it's spent forever
+# --- bounce scoring: how many candles after a touch to measure the reaction ---
+BOUNCE_MEASURE_CANDLES = 6
 MAX_LINE_DISTANCE_USD = 30  # a trendline projecting further than this from current price is treated as stale/unreliable
 # session windows in PKT: (start_hour,start_min,end_hour,end_min)
 SESSION_WINDOWS = [(7, 0, 16, 0), (20, 0, 23, 0)]
@@ -157,34 +166,237 @@ def find_swings(candles, lookback):
     return highs, lows
 
 
-# ============================= TRENDLINES =============================
+# ============================= TRENDLINES (fit-and-score) =============================
 def recent_swings(swings, total_candles, window):
     """Only keep swing points from within the last `window` candles."""
     cutoff = total_candles - window
     return [s for s in swings if s["i"] >= cutoff]
 
 
-def detect_trendline(swings, min_touches, deviation):
-    if len(swings) < 3:
+def measure_bounce(candles, touch_idx, line_slope, line_intercept, side, lookahead=BOUNCE_MEASURE_CANDLES):
+    """How far did price travel AWAY from the line in the candles right after a touch?
+
+    A big bounce means the level had real defenders. For a break-and-retest trader that's
+    exactly what you want: the more energy a level absorbed while holding, the more gets
+    released (trapped orders, stop runs) when it finally breaks.
+    """
+    end = min(len(candles), touch_idx + lookahead + 1)
+    best = 0.0
+    for i in range(touch_idx + 1, end):
+        lv = line_slope * i + line_intercept
+        c = candles[i]
+        if side == "resistance":
+            dist = lv - c["l"]      # resistance holds -> price pushed DOWN away from line
+        else:
+            dist = c["h"] - lv      # support holds -> price pushed UP away from line
+        if dist > best:
+            best = dist
+    return best
+
+
+def line_is_live(candles, slope, intercept, side, touch_idxs, price, atr_val):
+    """Liveness checks for the 5m ENTRY line (not applied to obstacle lines).
+
+    1. Line must project within LINE_MAX_DISTANCE_ATR x ATR of current price.
+    2. Last touch/break must be within LINE_ACTIVITY_WINDOW_CANDLES.
+    3. Not spent: if price EVER travelled more than LINE_SPENT_ATR x ATR beyond the line
+       (on the far side only - drifting away on the SAME side never counts as spent),
+       the structure has delivered its move and is discarded permanently.
+    """
+    if not atr_val or atr_val <= 0:
+        return False, "no ATR"
+    n = len(candles)
+
+    line_now = slope * (n - 1) + intercept
+    if abs(line_now - price) > LINE_MAX_DISTANCE_ATR * atr_val:
+        return False, "line too far from price"
+
+    if touch_idxs and (n - 1 - max(touch_idxs)) > LINE_ACTIVITY_WINDOW_CANDLES:
+        return False, "line inactive too long"
+
+    spent_threshold = LINE_SPENT_ATR * atr_val
+    for i in range(n):
+        lv = slope * i + intercept
+        c = candles[i]
+        if side == "resistance":
+            # spent only if price broke ABOVE and ran far beyond
+            if c["c"] - lv > spent_threshold:
+                return False, "line already spent (price ran far above)"
+        else:
+            # spent only if price broke BELOW and ran far beyond
+            if lv - c["c"] > spent_threshold:
+                return False, "line already spent (price ran far below)"
+
+    return True, None
+
+
+def detect_trendline(candles, side, window, deviation=LINE_DEVIATION_USD,
+                     min_touches=MIN_TRENDLINE_TOUCHES, min_span=MIN_TRENDLINE_SPAN_CANDLES,
+                     price=None, atr_val=None, apply_liveness=False):
+    """Fit-and-score trendline detection.
+
+    Draws a candidate line through EVERY pair of candle wicks in the window, then counts
+    how many wicks come within `deviation` of that line. This avoids the old bug where
+    genuine touches on a sloped line disqualified each other.
+
+    side='resistance' -> uses candle highs, line sits above price (declining line in a fall)
+    side='support'    -> uses candle lows,  line sits below price (inclining line in a rise)
+
+    SCORING (tuned for a break-and-retest trader):
+      * PRIMARY: total bounce magnitude, ATR-normalised. A level that produced big
+        reactions had real defenders; when it breaks, those trapped positions fuel the move.
+        This is what determines whether a break can actually run 2x ATR to target.
+      * GATE: minimum touch count and minimum time span (structure must be real).
+      * PENALTY: candle closes past the line before the break (line not respected).
+      * FILTER: slope sanity, plus optional liveness checks for the 5m entry line.
+    """
+    n = len(candles)
+    if n < min_span + 2:
         return None
-    pts = swings[-12:]
+    start = max(0, n - window)
+    idxs = list(range(start, n))
+    if len(idxs) < 3:
+        return None
+
+    key = "h" if side == "resistance" else "l"
+    pts = [(i, candles[i][key]) for i in idxs]
+
     best = None
     for a in range(len(pts)):
         for b in range(a + 1, len(pts)):
-            p1, p2 = pts[a], pts[b]
-            if p2["i"] == p1["i"]:
+            i1, p1 = pts[a]
+            i2, p2 = pts[b]
+            if i2 == i1 or (i2 - i1) < min_span:
                 continue
-            slope = (p2["price"] - p1["price"]) / (p2["i"] - p1["i"])
-            intercept = p1["price"] - slope * p1["i"]
-            touches = sum(1 for p in pts if abs(p["price"] - (slope * p["i"] + intercept)) <= deviation)
-            if touches >= min_touches and (best is None or touches > best["touches"]):
-                best = {"slope": slope, "intercept": intercept, "touches": touches,
-                        "last_touch_i": max(p1["i"], p2["i"])}
+
+            slope = (p2 - p1) / (i2 - i1)
+            intercept = p1 - slope * i1
+
+            if abs(slope) > MAX_TRENDLINE_SLOPE_USD_PER_CANDLE:
+                continue
+
+            touch_idxs = [i for i, pval in pts
+                          if abs(pval - (slope * i + intercept)) <= deviation]
+            if len(touch_idxs) < min_touches:
+                continue
+
+            span = max(touch_idxs) - min(touch_idxs)
+            if span < min_span:
+                continue
+
+            if apply_liveness:
+                ok, _reason = line_is_live(candles, slope, intercept, side,
+                                            touch_idxs, price, atr_val)
+                if not ok:
+                    continue
+
+            # --- cleanliness: candle closes past the line before the last touch ---
+            violations = 0
+            last_touch = max(touch_idxs)
+            for i in idxs:
+                if i > last_touch:
+                    break
+                lv = slope * i + intercept
+                c = candles[i]["c"]
+                if side == "resistance" and c > lv + deviation:
+                    violations += 1
+                elif side == "support" and c < lv - deviation:
+                    violations += 1
+
+            # --- PRIMARY METRIC: bounce magnitude across all touches ---
+            bounces = [measure_bounce(candles, ti, slope, intercept, side) for ti in touch_idxs]
+            total_bounce = sum(bounces)
+            avg_bounce = total_bounce / len(bounces) if bounces else 0.0
+            # normalise by ATR so this means the same thing in quiet and volatile conditions
+            norm = atr_val if (atr_val and atr_val > 0) else 1.0
+            bounce_score = (total_bounce / norm) * 6.0 + (avg_bounce / norm) * 10.0
+
+            score = bounce_score + (len(touch_idxs) * 2) + (span * 0.2) - (violations * 8)
+
+            if best is None or score > best["score"]:
+                best = {
+                    "slope": slope, "intercept": intercept,
+                    "touches": len(touch_idxs), "span": span,
+                    "violations": violations, "score": score,
+                    "total_bounce": total_bounce, "avg_bounce": avg_bounce,
+                    "last_touch_i": last_touch, "side": side,
+                }
+    return best
+
+
+def detect_nearest_obstacle_line(candles, side, window, entry, target,
+                                 deviation=LINE_DEVIATION_USD,
+                                 min_touches=MIN_TRENDLINE_TOUCHES,
+                                 min_span=MIN_TRENDLINE_SPAN_CANDLES):
+    """For higher-timeframe OBSTACLE lines (15m/30m/1H).
+
+    Unlike the 5m entry line, freshness doesn't matter here - a dormant wall still stops
+    price when it gets there. So no liveness filtering. What matters is which qualifying
+    line sits NEAREST to the entry->target path.
+    """
+    n = len(candles)
+    if n < min_span + 2:
+        return None
+    start = max(0, n - window)
+    idxs = list(range(start, n))
+    if len(idxs) < 3:
+        return None
+
+    key = "h" if side == "resistance" else "l"
+    pts = [(i, candles[i][key]) for i in idxs]
+    lo, hi = (entry, target) if target > entry else (target, entry)
+
+    best = None
+    for a in range(len(pts)):
+        for b in range(a + 1, len(pts)):
+            i1, p1 = pts[a]
+            i2, p2 = pts[b]
+            if i2 == i1 or (i2 - i1) < min_span:
+                continue
+            slope = (p2 - p1) / (i2 - i1)
+            intercept = p1 - slope * i1
+            if abs(slope) > MAX_TRENDLINE_SLOPE_USD_PER_CANDLE:
+                continue
+            touch_idxs = [i for i, pval in pts
+                          if abs(pval - (slope * i + intercept)) <= deviation]
+            if len(touch_idxs) < min_touches:
+                continue
+            if (max(touch_idxs) - min(touch_idxs)) < min_span:
+                continue
+
+            line_now = slope * (n - 1) + intercept
+            if not (lo <= line_now <= hi):
+                continue  # not in the path, not an obstacle
+
+            dist_from_entry = abs(line_now - entry)
+            if best is None or dist_from_entry < best["dist_from_entry"]:
+                best = {"slope": slope, "intercept": intercept, "side": side,
+                        "touches": len(touch_idxs), "line_now": line_now,
+                        "dist_from_entry": dist_from_entry}
     return best
 
 
 def line_value_at(line, idx):
     return line["slope"] * idx + line["intercept"]
+
+
+def find_path_obstacles(direction, entry, target, obstacle_lines):
+    """Check whether any higher-timeframe trendline sits between entry and the 2xATR target.
+
+    obstacle_lines: list of (label, line_dict, candles) - each is that timeframe's single
+    best-scoring trendline. Returns a list of human-readable obstacle descriptions.
+    An empty list means the path to target is clear.
+    """
+    obstacles = []
+    lo, hi = (entry, target) if target > entry else (target, entry)
+    for label, line, cands in obstacle_lines:
+        if not line or not cands:
+            continue
+        lv = line_value_at(line, len(cands) - 1)
+        if lo <= lv <= hi:
+            side_txt = "resistance" if line.get("side") == "resistance" else "support"
+            obstacles.append(f"{label} {side_txt} trendline at ~${lv:.2f} sits in the path to target")
+    return obstacles
 
 
 def retest_touch_found(candles, level_at, deviation, lookback=10):
@@ -293,23 +505,19 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
     rsi30 = rsi_series([c["c"] for c in candles30], RSI_PERIOD)
     atr5 = atr(candles5, ATR_PERIOD)
 
-    sw5h, sw5l = find_swings(candles5, SWING_LOOKBACK)
-    sw15h, sw15l = find_swings(candles15, SWING_LOOKBACK)
-    sw30h, sw30l = find_swings(candles30, SWING_LOOKBACK)
-
-    # only use touches from the recent window per timeframe (matches original spec:
-    # 5m -> last 20 candles, 15m/30m -> last 50 candles) so lines can't be built from
-    # swings hours old and extrapolated forward into a stale, unrealistic value.
-    sw5h_r = recent_swings(sw5h, len(candles5), TRENDLINE_RECENCY_CANDLES[5])
-    sw5l_r = recent_swings(sw5l, len(candles5), TRENDLINE_RECENCY_CANDLES[5])
-    sw15h_r = recent_swings(sw15h, len(candles15), TRENDLINE_RECENCY_CANDLES[15])
-    sw15l_r = recent_swings(sw15l, len(candles15), TRENDLINE_RECENCY_CANDLES[15])
-    sw30h_r = recent_swings(sw30h, len(candles30), TRENDLINE_RECENCY_CANDLES[30])
-    sw30l_r = recent_swings(sw30l, len(candles30), TRENDLINE_RECENCY_CANDLES[30])
-
-    tl5up, tl5dn = detect_trendline(sw5h_r, 3, LINE_DEVIATION_USD), detect_trendline(sw5l_r, 3, LINE_DEVIATION_USD)
-    tl15up, tl15dn = detect_trendline(sw15h_r, 3, LINE_DEVIATION_USD), detect_trendline(sw15l_r, 3, LINE_DEVIATION_USD)
-    tl30up, tl30dn = detect_trendline(sw30h_r, 3, LINE_DEVIATION_USD), detect_trendline(sw30l_r, 3, LINE_DEVIATION_USD)
+    # 5m ENTRY lines: full liveness filtering + bounce-weighted scoring.
+    tl5up = detect_trendline(candles5, "resistance", TRENDLINE_RECENCY_CANDLES[5],
+                             price=price, atr_val=atr5, apply_liveness=True)
+    tl5dn = detect_trendline(candles5, "support", TRENDLINE_RECENCY_CANDLES[5],
+                             price=price, atr_val=atr5, apply_liveness=True)
+    # 15m also feeds the CORE trendline check, so it gets the same treatment.
+    tl15up = detect_trendline(candles15, "resistance", TRENDLINE_RECENCY_CANDLES[15],
+                              price=price, atr_val=atr5, apply_liveness=True)
+    tl15dn = detect_trendline(candles15, "support", TRENDLINE_RECENCY_CANDLES[15],
+                              price=price, atr_val=atr5, apply_liveness=True)
+    # 30m is confluence-only: scored, but no liveness gating.
+    tl30up = detect_trendline(candles30, "resistance", TRENDLINE_RECENCY_CANDLES[30], atr_val=atr5)
+    tl30dn = detect_trendline(candles30, "support", TRENDLINE_RECENCY_CANDLES[30], atr_val=atr5)
 
     res_clusters, sup_clusters = detect_sr(candles60, SR_DEVIATION_USD)
     resistances = [c["avg"] for c in res_clusters]
@@ -327,25 +535,29 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
     ma_proximity = ma21 is not None and abs(price - ma21) <= FAST_MA_PROXIMITY_USD
 
     def eval_side(direction):
-        conds = []
+        conds = []  # CORE conditions - these drive the signal
+        confluence = []  # CONFLUENCE conditions - bonus only, shown but never required
+
         session_label = "Within trading session (7am-4pm or 8pm-11pm PKT)"
         if bypass_session and not real_in_session:
             session_label += " [bypassed for demo run]"
         conds.append(("session", session_label, in_session))
         conds.append(("ma_proximity", f"21MA(5m) within ${FAST_MA_PROXIMITY_USD} of price", ma_proximity))
 
-        relevant = ([("5m", tl5dn, candles5), ("15m", tl15dn, candles15), ("30m", tl30dn, candles30)]
-                    if direction == "buy" else
-                    [("5m", tl5up, candles5), ("15m", tl15up, candles15), ("30m", tl30up, candles30)])
-        tl_break_pass, tl_break_desc = False, "No valid trendline break found"
+        # --- CORE trendline: 5m and 15m only (30m demoted to confluence) ---
+        # BUY = price breaks ABOVE resistance (line drawn from swing HIGHS), standard continuation.
+        # SELL = price breaks BELOW support (line drawn from swing LOWS), standard continuation.
+        core_tf = ([("5m", tl5up, candles5), ("15m", tl15up, candles15)] if direction == "buy" else
+                   [("5m", tl5dn, candles5), ("15m", tl15dn, candles15)])
+        tl_break_pass, tl_break_desc = False, "No valid trendline break found (5m/15m)"
         tl_retest_pass, tl_retest_desc = False, "No trendline retest to confirm (no break yet)"
-        for tf, line, cands in relevant:
+        for tf, line, cands in core_tf:
             if not line:
                 continue
             last_len = len(cands)
             line_now = line_value_at(line, last_len - 1)
             if abs(line_now - price) > MAX_LINE_DISTANCE_USD:
-                continue  # projection too far from current price to be a reliable/relevant line
+                continue
             broke = (price > line_now + MIN_BREAK_USD) if direction == "buy" else (price < line_now - MIN_BREAK_USD)
             if not broke:
                 continue
@@ -357,46 +569,65 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
                 tl_retest_desc = f"Trendline retest confirmed on {tf} (within ${TRENDLINE_RETEST_DEVIATION_USD})"
             else:
                 tl_retest_desc = f"Trendline broke on {tf} but no retest touch yet"
-            break  # use the first qualifying timeframe's break/retest pair together
+            break
         conds.append(("trendline_break", tl_break_desc, tl_break_pass))
         conds.append(("trendline_retest", tl_retest_desc, tl_retest_pass))
 
-        sr_break_pass, sr_break_desc = False, "No 1H support/resistance break found"
-        sr_retest_pass, sr_retest_desc = False, "No 1H retest to confirm (no break yet)"
-        sr_level = None
-        if direction == "buy" and nearest_res is not None and price > nearest_res + MIN_BREAK_USD:
-            sr_level = nearest_res
-            sr_break_pass, sr_break_desc = True, f"1H resistance ~${nearest_res:.2f} broken"
-        if direction == "sell" and nearest_sup is not None and price < nearest_sup - MIN_BREAK_USD:
-            sr_level = nearest_sup
-            sr_break_pass, sr_break_desc = True, f"1H support ~${nearest_sup:.2f} broken"
-        if sr_break_pass:
-            if retest_touch_found(candles60, lambda i: sr_level, SR_DEVIATION_USD):
-                sr_retest_pass, sr_retest_desc = True, f"1H level ~${sr_level:.2f} retested (within ${SR_DEVIATION_USD})"
-            else:
-                sr_retest_desc = f"1H level ~${sr_level:.2f} broke but no retest touch yet"
-        conds.append(("sr_break", sr_break_desc, sr_break_pass))
-        conds.append(("sr_retest", sr_retest_desc, sr_retest_pass))
-
+        # --- CORE line-strike (5m) ---
         want_rev = "up" if direction == "buy" else "down"
         strike_match = strike_type is not None and strike_rev == want_rev
         strike_desc = (f"{'3-line strike' if strike_type=='3-line' else '2-line strike (partial)'} confirms rejection"
                         if strike_match else "No qualifying line-strike rejection yet")
         conds.append(("strike", strike_desc, strike_match))
 
+        # --- CORE divergence: 5m and 15m only (30m demoted to confluence) ---
         want_key = "bullish" if direction == "buy" else "bearish"
-        hits = []
-        for label, d in (("5m", div5), ("15m", div15), ("30m", div30)):
+        core_hits = []
+        for label, d in (("5m", div5), ("15m", div15)):
             if d[want_key]:
-                hits.append(f"{label} {d[want_key]}")
-        div_desc = f"RSI divergence: {', '.join(hits)}" if hits else "No RSI divergence in trade direction"
-        conds.append(("divergence", div_desc, len(hits) > 0))
+                core_hits.append(f"{label} {d[want_key]}")
+        div_desc = f"RSI divergence: {', '.join(core_hits)}" if core_hits else "No RSI divergence in trade direction (5m/15m)"
+        conds.append(("divergence", div_desc, len(core_hits) > 0))
 
-        passed = sum(1 for _, _, p in conds if p)
-        total = len(conds)
+        # ============= CONFLUENCE (30m trendline + 1H S&R) - bonus only =============
+        tl30 = tl30up if direction == "buy" else tl30dn
+        if tl30:
+            line_now_30 = line_value_at(tl30, len(candles30) - 1)
+            if abs(line_now_30 - price) <= MAX_LINE_DISTANCE_USD:
+                broke_30 = (price > line_now_30 + MIN_BREAK_USD) if direction == "buy" else (price < line_now_30 - MIN_BREAK_USD)
+                if broke_30:
+                    confluence.append(("confluence_tl30_break", f"Bonus: 30m trendline break (line ~${line_now_30:.2f})", True))
+                    if retest_touch_found(candles30, lambda i: line_value_at(tl30, i), TRENDLINE_RETEST_DEVIATION_USD):
+                        confluence.append(("confluence_tl30_retest", "Bonus: 30m trendline retest confirmed", True))
+
+        sr_break_pass, sr_break_desc = False, None
+        sr_level = None
+        if direction == "buy" and nearest_res is not None and price > nearest_res + MIN_BREAK_USD:
+            sr_level, sr_break_pass, sr_break_desc = nearest_res, True, f"Bonus: 1H resistance ~${nearest_res:.2f} broken"
+        if direction == "sell" and nearest_sup is not None and price < nearest_sup - MIN_BREAK_USD:
+            sr_level, sr_break_pass, sr_break_desc = nearest_sup, True, f"Bonus: 1H support ~${nearest_sup:.2f} broken"
+        if sr_break_pass:
+            confluence.append(("confluence_sr_break", sr_break_desc, True))
+            if retest_touch_found(candles60, lambda i: sr_level, SR_DEVIATION_USD):
+                confluence.append(("confluence_sr_retest", f"Bonus: 1H level ~${sr_level:.2f} retested", True))
+
+        if div30[want_key]:
+            confluence.append(("confluence_div30", f"Bonus: 30m RSI divergence ({div30[want_key]})", True))
+
+        core_passed = sum(1 for _, _, p in conds if p)
+        core_total = len(conds)
+        confluence_count = len(confluence)  # confluence list only ever contains passed items; shown as bonus info only
+
+        # Full signal requires ALL 6 core conditions - confluence never gates or delays this,
+        # since 30m/1H structure breaks far less often than 5m/15m and shouldn't hold up real trades.
+        full_signal = core_passed >= FULL_SIGNAL_MIN_CONDITIONS
+        pre_signal = core_passed >= PRE_SIGNAL_MIN_CONDITIONS
+        strong_pre_signal = core_passed >= FULL_SIGNAL_MIN_CONDITIONS - 1  # one condition away - worth flagging clearly
+
         return {
-            "dir": direction, "conds": conds, "passed": passed, "total": total,
-            "all_pass": passed >= FULL_SIGNAL_MIN_CONDITIONS, "nearly_all": passed >= PRE_SIGNAL_MIN_CONDITIONS,
+            "dir": direction, "conds": conds, "confluence": confluence,
+            "passed": core_passed, "total": core_total, "confluence_count": confluence_count,
+            "all_pass": full_signal, "nearly_all": pre_signal, "strong_pre": strong_pre_signal,
         }
 
     buy_side, sell_side = eval_side("buy"), eval_side("sell")
@@ -410,6 +641,7 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
             state = "PRE_BUY" if chosen["dir"] == "buy" else "PRE_SELL"
 
     entry = sl = tp = None
+    obstacles = []
     if atr5 and state != "NO_TRADE" and state != "WARMING_UP":
         dist = atr5 * 2
         entry = price
@@ -418,9 +650,27 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
         else:
             sl, tp = price + dist, price - dist * RISK_REWARD
 
+        # Room-to-target check: find the NEAREST qualifying trendline on 15m/30m/1H sitting
+        # between entry and target. No liveness filter here - a dormant wall still blocks price.
+        direction_is_buy = "BUY" in state
+        obs_side = "resistance" if direction_is_buy else "support"
+        obstacles = []
+        for label, cands, win in (("15m", candles15, TRENDLINE_RECENCY_CANDLES[15]),
+                                   ("30m", candles30, TRENDLINE_RECENCY_CANDLES[30]),
+                                   ("1H", candles60, TRENDLINE_RECENCY_CANDLES[60])):
+            ob = detect_nearest_obstacle_line(cands, obs_side, win, entry, tp)
+            if ob:
+                obstacles.append(
+                    f"{label} {obs_side} trendline at ~${ob['line_now']:.2f} sits in the path to target")
+
+    is_risky = len(obstacles) > 0 and state in ("BUY", "SELL")
+
     return {
         "state": state, "price": price, "entry": entry, "sl": sl, "tp": tp,
         "conds": chosen["conds"], "passed": chosen["passed"], "total": chosen["total"],
+        "confluence": chosen["confluence"], "confluence_count": chosen["confluence_count"],
+        "strong_pre": chosen["strong_pre"],
+        "obstacles": obstacles, "is_risky": is_risky,
         "indicators": {"ma21": ma21, "ma50": ma50, "ma200": ma200,
                        "rsi": rsi5[-1] if rsi5 else None, "atr": atr5, "in_session": in_session},
     }
@@ -452,17 +702,24 @@ def build_message(res):
     elif state == "SELL":
         lines.append("🔴 <b>XAU SELL SIGNAL</b>")
     elif state == "PRE_BUY":
-        lines.append("🟡 <b>Pre-signal: BUY building</b>")
+        label = "🟠 <b>Strong pre-signal: BUY building</b>" if res.get("strong_pre") else "🟡 <b>Pre-signal: BUY building</b>"
+        lines.append(label)
     elif state == "PRE_SELL":
-        lines.append("🟡 <b>Pre-signal: SELL building</b>")
+        label = "🟠 <b>Strong pre-signal: SELL building</b>" if res.get("strong_pre") else "🟡 <b>Pre-signal: SELL building</b>"
+        lines.append(label)
 
     lines.append(f"Price: ${fmt(res['price'])}")
     if res.get("entry") is not None:
         lines.append(f"Entry: ${fmt(res['entry'])} | SL: ${fmt(res['sl'])} | TP: ${fmt(res['tp'])}")
-    lines.append(f"Conditions met: {res['passed']}/{res['total']}")
+    lines.append(f"Core conditions met: {res['passed']}/{res['total']} (5m/15m)")
     lines.append("")
     for _, label, passed in res["conds"]:
         lines.append(f"{'✅' if passed else '▫️'} {label}")
+    if res.get("confluence"):
+        lines.append("")
+        lines.append(f"✨ <b>Confluence (30m/1H, bonus):</b>")
+        for _, label, _ in res["confluence"]:
+            lines.append(f"✨ {label}")
     return "\n".join(lines)
 
 
@@ -470,24 +727,38 @@ def build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits):
     """Message for a CONFIRMED (not pre-) BUY/SELL, including its signal number and
     the running TP/SL tally as it stood *before* this trade resolves."""
     emoji = "🟢" if res["state"] == "BUY" else "🔴"
-    lines = [f"{emoji} <b>XAU {res['state']} SIGNAL — Signal #{signal_number}</b>",
+    risky_tag = " (Risky)" if res.get("is_risky") else ""
+    tracker = "Risky signal" if res.get("is_risky") else "Signal"
+    lines = [f"{emoji} <b>XAU {res['state']}{risky_tag} — {tracker} #{signal_number}</b>",
              f"(so far: TP hit: {tp_hits}, SL hit: {sl_hits})",
-             "",
-             f"Price: ${fmt(res['price'])}",
-             f"Entry: ${fmt(res['entry'])} | SL: ${fmt(res['sl'])} | TP: ${fmt(res['tp'])}",
-             f"Conditions met: {res['passed']}/{res['total']}",
              ""]
+    if res.get("obstacles"):
+        lines.append("⚠️ <b>Risk reasons:</b>")
+        for o in res["obstacles"]:
+            lines.append(f"⚠️ {o}")
+        lines.append("")
+    lines += [f"Price: ${fmt(res['price'])}",
+              f"Entry: ${fmt(res['entry'])} | SL: ${fmt(res['sl'])} | TP: ${fmt(res['tp'])}",
+              f"Core conditions met: {res['passed']}/{res['total']} (5m/15m)",
+              ""]
     for _, label, passed in res["conds"]:
         lines.append(f"{'✅' if passed else '▫️'} {label}")
+    if res.get("confluence"):
+        lines.append("")
+        lines.append("✨ <b>Confluence (30m/1H, bonus):</b>")
+        for _, label, _ in res["confluence"]:
+            lines.append(f"✨ {label}")
     return "\n".join(lines)
 
 
 def build_outcome_message(trade, outcome, tp_hits, sl_hits):
     result = "✅ TP HIT" if outcome == "TP" else "❌ SL HIT"
+    kind = trade.get("kind", "confirmed")
+    kind_label = {"confirmed": "Signal", "risky": "Risky signal", "pre": "Pre-signal"}.get(kind, "Signal")
     return "\n".join([
-        f"📊 <b>Signal #{trade['signal_number']} result: {result}</b>",
+        f"📊 <b>{kind_label} #{trade['signal_number']} result: {result}</b>",
         f"{trade['dir']} | Entry ${fmt(trade['entry'])} | SL ${fmt(trade['sl'])} | TP ${fmt(trade['tp'])}",
-        f"Running total — TP hit: {tp_hits}, SL hit: {sl_hits}",
+        f"{kind_label} running total — TP hit: {tp_hits}, SL hit: {sl_hits}",
     ])
 
 
@@ -523,11 +794,20 @@ def process_pending_trades(candles5, state_store):
         if outcome is None:
             still_pending.append(trade)
             continue
-        if outcome == "TP":
-            state_store["tp_hits"] = state_store.get("tp_hits", 0) + 1
+        kind = trade.get("kind", "confirmed")
+        if kind == "risky":
+            tp_key, sl_key = "risky_tp_hits", "risky_sl_hits"
+        elif kind == "pre":
+            tp_key, sl_key = "pre_tp_hits", "pre_sl_hits"
         else:
-            state_store["sl_hits"] = state_store.get("sl_hits", 0) + 1
-        send_telegram(build_outcome_message(trade, outcome, state_store.get("tp_hits", 0), state_store.get("sl_hits", 0)))
+            tp_key, sl_key = "tp_hits", "sl_hits"
+
+        if outcome == "TP":
+            state_store[tp_key] = state_store.get(tp_key, 0) + 1
+        else:
+            state_store[sl_key] = state_store.get(sl_key, 0) + 1
+        send_telegram(build_outcome_message(trade, outcome,
+                                            state_store.get(tp_key, 0), state_store.get(sl_key, 0)))
     state_store["pending_trades"] = still_pending
 
 
@@ -539,9 +819,16 @@ def load_state():
     except Exception:
         data = {}
     data.setdefault("last_state", "NONE")
+    # Three independent trackers: confirmed signals, risky signals, and pre-signals
     data.setdefault("signal_counter", 0)
     data.setdefault("tp_hits", 0)
     data.setdefault("sl_hits", 0)
+    data.setdefault("risky_counter", 0)
+    data.setdefault("risky_tp_hits", 0)
+    data.setdefault("risky_sl_hits", 0)
+    data.setdefault("pre_counter", 0)
+    data.setdefault("pre_tp_hits", 0)
+    data.setdefault("pre_sl_hits", 0)
     data.setdefault("pending_trades", [])
     return data
 
@@ -596,23 +883,25 @@ def main():
         # regardless of whether the state actually changed. Demo runs do NOT register signals
         # or affect the TP/SL tally, so testing never pollutes your real track record.
         prefix = "🧪 <b>Demo run</b>\n\n" if current_state == "NO_TRADE" else ""
-        send_telegram(prefix + build_message(res) if current_state != "NO_TRADE" else
-                      prefix + f"Price: ${fmt(res['price'])}\nConditions met: {res['passed']}/{res['total']}\n\n" +
-                      "\n".join(f"{'✅' if p else '▫️'} {label}" for _, label, p in res["conds"]))
+        send_telegram(prefix + build_message(res))
         print("Manual run: notification sent regardless of state change.")
         return
 
     if current_state in ("BUY", "SELL") and current_state != last_state:
-        # Confirmed signal: assign a signal number, send with the running tally, and track it
-        # so a future run can detect whether it hit TP or SL.
-        tp_hits, sl_hits = state_store.get("tp_hits", 0), state_store.get("sl_hits", 0)
-        signal_number = state_store.get("signal_counter", 0) + 1
-        state_store["signal_counter"] = signal_number
+        is_risky = res.get("is_risky", False)
+        if is_risky:
+            counter_key, tp_key, sl_key, kind = "risky_counter", "risky_tp_hits", "risky_sl_hits", "risky"
+        else:
+            counter_key, tp_key, sl_key, kind = "signal_counter", "tp_hits", "sl_hits", "confirmed"
+
+        tp_hits, sl_hits = state_store.get(tp_key, 0), state_store.get(sl_key, 0)
+        signal_number = state_store.get(counter_key, 0) + 1
+        state_store[counter_key] = signal_number
 
         send_telegram(build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits))
 
         state_store.setdefault("pending_trades", []).append({
-            "signal_number": signal_number, "dir": current_state,
+            "signal_number": signal_number, "dir": current_state, "kind": kind,
             "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
             "opened_at_ms": int(now_utc.timestamp() * 1000),
         })
@@ -621,8 +910,22 @@ def main():
         save_state(state_store)
 
     elif current_state in ("PRE_BUY", "PRE_SELL") and current_state != last_state:
-        # Pre-signals are informational only - not numbered, not tracked for TP/SL.
-        send_telegram(build_message(res))
+        # Pre-signals get their own independent counter and TP/SL tracker.
+        pre_number = state_store.get("pre_counter", 0) + 1
+        state_store["pre_counter"] = pre_number
+        pre_tp, pre_sl = state_store.get("pre_tp_hits", 0), state_store.get("pre_sl_hits", 0)
+
+        msg = build_message(res)
+        msg += f"\n\n<i>Pre-signal #{pre_number} (so far: TP hit: {pre_tp}, SL hit: {pre_sl})</i>"
+        send_telegram(msg)
+
+        if res.get("entry") is not None:
+            state_store.setdefault("pending_trades", []).append({
+                "signal_number": pre_number, "dir": "BUY" if current_state == "PRE_BUY" else "SELL",
+                "kind": "pre",
+                "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
+                "opened_at_ms": int(now_utc.timestamp() * 1000),
+            })
         state_store["last_state"] = current_state
         save_state(state_store)
 
