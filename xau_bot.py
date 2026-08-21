@@ -841,7 +841,11 @@ def save_state(state):
 # ============================= MAIN =============================
 def main():
     now_utc = datetime.now(timezone.utc)
-    is_manual_run = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+    # A manual run should send one confirmation message, not one per loop iteration.
+    # The workflow sets SCAN_ITERATION; only the first pass counts as the demo run.
+    scan_iteration = os.environ.get("SCAN_ITERATION", "1")
+    is_manual_run = (os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                     and scan_iteration == "1")
 
     if not in_session_window(now_utc) and not is_manual_run:
         print("Outside trading session window (PKT). Skipping this run.")
