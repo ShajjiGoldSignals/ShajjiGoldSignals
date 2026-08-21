@@ -4,5 +4,11 @@
   "signal_counter": 0,
   "tp_hits": 0,
   "sl_hits": 0,
-  "pending_trades": []
+  "pending_trades": [],
+  "risky_counter": 0,
+  "risky_tp_hits": 0,
+  "risky_sl_hits": 0,
+  "pre_counter": 0,
+  "pre_tp_hits": 0,
+  "pre_sl_hits": 0
 }
