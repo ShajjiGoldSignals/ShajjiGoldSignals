@@ -1,14 +1,24 @@
 {
-  "last_state": "NONE",
+  "last_state": "PRE_BUY",
   "last_signal_time": "2026-08-19T09:28:17.498235+00:00",
   "signal_counter": 0,
   "tp_hits": 0,
   "sl_hits": 0,
-  "pending_trades": [],
+  "pending_trades": [
+    {
+      "signal_number": 1,
+      "dir": "BUY",
+      "kind": "pre",
+      "entry": 4614.399902,
+      "sl": 4607.283316509239,
+      "tp": 4621.516487490761,
+      "opened_at_ms": 1787328220357
+    }
+  ],
   "risky_counter": 0,
   "risky_tp_hits": 0,
   "risky_sl_hits": 0,
-  "pre_counter": 0,
+  "pre_counter": 1,
   "pre_tp_hits": 0,
   "pre_sl_hits": 0
 }
