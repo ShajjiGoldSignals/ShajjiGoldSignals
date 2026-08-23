@@ -10,5 +10,7 @@
   "risky_sl_hits": 0,
   "pre_counter": 1,
   "pre_tp_hits": 1,
-  "pre_sl_hits": 0
+  "pre_sl_hits": 0,
+  "last_seen_price": 4604.399902,
+  "last_heartbeat_date": "2026-08-23"
 }
