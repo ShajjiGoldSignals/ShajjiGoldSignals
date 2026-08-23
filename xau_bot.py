@@ -27,7 +27,7 @@ SR_DEVIATION_USD = 5            # support/resistance touch tolerance AND retest 
 SWING_LOOKBACK = 5
 RISK_REWARD = 1
 PRE_SIGNAL_MIN_CONDITIONS = 4   # fire a pre-signal once at least this many of the 6 CORE conditions are met
-FULL_SIGNAL_MIN_CONDITIONS = 6  # full signal needs all 6 core, OR 5/6 core + at least 1 confluence bonus
+FULL_SIGNAL_MIN_CONDITIONS = 6  # full signal needs ALL 6 core; confluence never upgrades or blocks
 # a trendline must be built from swing touches within this many recent candles per timeframe
 TRENDLINE_RECENCY_CANDLES = {5: 150, 15: 190, 30: 96, 60: 48}
 MIN_TRENDLINE_TOUCHES = 3            # minimum gate; bounce magnitude is the real differentiator
@@ -79,6 +79,23 @@ def ts_of(point):
     if isinstance(t, (int, float)):
         return t if t > 2e10 else t * 1000
     return datetime.now(timezone.utc).timestamp() * 1000
+
+
+def drop_forming_candle(candles, interval_min, now_utc):
+    """Remove the still-forming candle so evaluation matches a closed MT5 bar.
+
+    The newest bucket is only complete once its interval has fully elapsed. Until then its
+    'close' is just the latest tick, which moves constantly - a wick can look like a break
+    and then vanish on the next scan. MT5 only treats a bar as final once it closes, so we
+    do the same: every indicator, trendline and pattern sees completed candles only.
+    """
+    if not candles:
+        return candles
+    bucket_ms = interval_min * 60000
+    now_ms = now_utc.timestamp() * 1000
+    if (now_ms - candles[-1]["t"]) < bucket_ms:
+        return candles[:-1]
+    return candles
 
 
 def build_candles(points, interval_min):
@@ -863,6 +880,18 @@ def _meter(passed, total):
     return "█" * passed + "░" * max(0, total - passed)
 
 
+def _price_lines(res):
+    """Decision price = last CLOSED candle. Live spot shown alongside for reference only."""
+    price = res.get("price")
+    live = res.get("live_spot")
+    if price is None:
+        return ["<b>XAU/USD</b>   <i>n/a</i>"]
+    out = [f"<b>XAU/USD</b>   <code>${price:.2f}</code>  <i>(last closed candle)</i>"]
+    if live is not None and abs(live - price) >= 0.01:
+        out.append(f"<code>LIVE     ${live:.2f}</code>")
+    return out
+
+
 def _levels_block(res):
     """Monospaced entry/stop/target block so the numbers line up on a phone."""
     if res.get("entry") is None:
@@ -931,9 +960,7 @@ def build_message(res):
     else:
         head = "⚪️ <b>NO TRADE</b>"
 
-    price = res.get("price")
-    price_txt = f"<code>${price:.2f}</code>" if price is not None else "<i>n/a</i>"
-    lines = [head, RULE, f"<b>XAU/USD</b>   {price_txt}"]
+    lines = [head, RULE] + _price_lines(res)
 
     levels = _levels_block(res)
     if levels:
@@ -953,7 +980,7 @@ def build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits):
         head = (f"🟢 <b>BUY SIGNAL</b> · <b>#{signal_number}</b>" if res["state"] == "BUY"
                 else f"🔴 <b>SELL SIGNAL</b> · <b>#{signal_number}</b>")
 
-    lines = [head, RULE, f"<b>XAU/USD</b>   <code>${res['price']:.2f}</code>"]
+    lines = [head, RULE] + _price_lines(res)
 
     levels = _levels_block(res)
     if levels:
@@ -1202,10 +1229,12 @@ def main():
             save_state(state_store)
         sys.exit(0)  # don't fail the workflow on a transient API hiccup
 
-    candles5 = build_candles(points, 5)
-    candles15 = build_candles(points, 15)
-    candles30 = build_candles(points, 30)
-    candles60 = build_candles(points, 60)
+    # Build candles, then drop the still-forming bar on each timeframe so every indicator,
+    # trendline and pattern is evaluated on CLOSED candles only - same as reading MT5.
+    candles5 = drop_forming_candle(build_candles(points, 5), 5, now_utc)
+    candles15 = drop_forming_candle(build_candles(points, 15), 15, now_utc)
+    candles30 = drop_forming_candle(build_candles(points, 30), 30, now_utc)
+    candles60 = drop_forming_candle(build_candles(points, 60), 60, now_utc)
 
     # --- Data sanity: fatal only when there is genuinely nothing to evaluate ---
     fatal, data_warnings = check_data_sanity(points, spot, candles5, state_store, now_utc)
@@ -1222,6 +1251,9 @@ def main():
 
     res = evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=is_manual_run)
     res["data_warnings"] = data_warnings
+    # The decision is made on the last CLOSED candle; carry the live spot through too so the
+    # message can show both without ever letting the live tick affect the logic.
+    res["live_spot"] = (spot or {}).get("spot_usd_oz")
 
     # Daily check-in runs regardless of session, so silence is never ambiguous.
     maybe_send_heartbeat(res, state_store, now_utc)
