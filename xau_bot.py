@@ -19,7 +19,6 @@ SYMBOL = "xau"
 INTRADAY_HOURS = 48
 ATR_PERIOD = 15
 RSI_PERIOD = 14
-MA_PERIODS = [21, 50, 200]
 FAST_MA_PROXIMITY_USD = 5
 MIN_BREAK_USD = 5
 LINE_DEVIATION_USD = 3          # trendline touch tolerance (for line validity itself)
@@ -45,6 +44,14 @@ MAX_LINE_DISTANCE_USD = 30  # a trendline projecting further than this from curr
 SESSION_WINDOWS = [(7, 0, 16, 0), (20, 0, 23, 0)]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+# --- Data sanity: these WARN, they never block a trade. Deliberately loose, because a
+# fast move is the signal in a break-and-retest strategy, not a data error. ---
+DATA_STALE_WARN_MINUTES = 15      # newest tick older than this -> flag as stale
+DATA_SPOT_MISMATCH_WARN = 5.0     # spot vs latest candle disagree by more than this
+DATA_JUMP_WARN_PCT = 3.0          # price moved this % since last scan
+DATA_WARN_COOLDOWN_MINUTES = 60   # don't repeat the same warning more often than this
+# --- Daily heartbeat ---
+HEARTBEAT_HOUR_PKT = 23           # send the daily summary at this PKT hour
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -75,36 +82,55 @@ def ts_of(point):
 
 
 def build_candles(points, interval_min):
+    """Build candles on FIXED CLOCK INTERVALS.
+
+    The free price feed delivers ticks irregularly - sometimes several minutes apart.
+    The previous version created one candle per tick received, so when ticks were sparse
+    a '5m candle' could actually span 10+ real minutes. That made every indicator wrong:
+    a '21-period MA on 5m' was really averaging a much longer, older stretch of price than
+    MT5's, so it could sit far from current price while the bot still judged it 'close'.
+
+    Now every interval gets exactly one candle. Intervals with no ticks carry the previous
+    close forward (flat candle), which is what a real chart shows during quiet periods.
+    """
     if not points:
         return []
     pts = sorted(points, key=ts_of)
     bucket_ms = interval_min * 60000
-    out = []
-    bucket_start = math.floor(ts_of(pts[0]) / bucket_ms) * bucket_ms
-    o = h = l = c = None
-    cnt = 0
 
-    def push():
-        if cnt > 0:
-            out.append({"t": bucket_start, "o": o, "h": h, "l": l, "c": c})
-
+    # Group ticks by their clock bucket
+    buckets = {}
     for p in pts:
-        ts = ts_of(p)
         price = p.get("p")
         if price is None:
             continue
-        bs = math.floor(ts / bucket_ms) * bucket_ms
-        if bs != bucket_start:
-            push()
-            bucket_start, o, h, l, c, cnt = bs, price, price, price, price, 1
+        bs = math.floor(ts_of(p) / bucket_ms) * bucket_ms
+        if bs not in buckets:
+            buckets[bs] = {"o": price, "h": price, "l": price, "c": price}
         else:
-            if o is None:
-                o = price
-            h = price if h is None else max(h, price)
-            l = price if l is None else min(l, price)
-            c = price
-            cnt += 1
-    push()
+            b = buckets[bs]
+            b["h"] = max(b["h"], price)
+            b["l"] = min(b["l"], price)
+            b["c"] = price
+
+    if not buckets:
+        return []
+
+    first_bs, last_bs = min(buckets), max(buckets)
+    out = []
+    prev_close = None
+    bs = first_bs
+    while bs <= last_bs:
+        if bs in buckets:
+            b = buckets[bs]
+            out.append({"t": bs, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]})
+            prev_close = b["c"]
+        elif prev_close is not None:
+            # No ticks this interval - carry the last close forward as a flat candle,
+            # so the candle count stays true to elapsed clock time.
+            out.append({"t": bs, "o": prev_close, "h": prev_close,
+                        "l": prev_close, "c": prev_close})
+        bs += bucket_ms
     return out
 
 
@@ -167,10 +193,6 @@ def find_swings(candles, lookback):
 
 
 # ============================= TRENDLINES (fit-and-score) =============================
-def recent_swings(swings, total_candles, window):
-    """Only keep swing points from within the last `window` candles."""
-    cutoff = total_candles - window
-    return [s for s in swings if s["i"] >= cutoff]
 
 
 def measure_bounce(candles, touch_idx, line_slope, line_intercept, side, lookahead=BOUNCE_MEASURE_CANDLES):
@@ -380,39 +402,38 @@ def line_value_at(line, idx):
     return line["slope"] * idx + line["intercept"]
 
 
-def find_path_obstacles(direction, entry, target, obstacle_lines):
-    """Check whether any higher-timeframe trendline sits between entry and the 2xATR target.
-
-    obstacle_lines: list of (label, line_dict, candles) - each is that timeframe's single
-    best-scoring trendline. Returns a list of human-readable obstacle descriptions.
-    An empty list means the path to target is clear.
-    """
-    obstacles = []
-    lo, hi = (entry, target) if target > entry else (target, entry)
-    for label, line, cands in obstacle_lines:
-        if not line or not cands:
-            continue
-        lv = line_value_at(line, len(cands) - 1)
-        if lo <= lv <= hi:
-            side_txt = "resistance" if line.get("side") == "resistance" else "support"
-            obstacles.append(f"{label} {side_txt} trendline at ~${lv:.2f} sits in the path to target")
-    return obstacles
 
 
-def retest_touch_found(candles, level_at, deviation, lookback=10):
+def retest_touch_found(candles, level_at, deviation, lookback=10, return_detail=False):
     """Check the recent candles (excluding the very latest, which is the break/rejection
     candle itself) for a genuine touch back to the line/level — i.e. price actually came
-    back and interacted with it after breaking, not just currently sitting past it."""
+    back and interacted with it after breaking, not just currently sitting past it.
+
+    With return_detail=True returns (found, closest_gap, level_at_closest) so the message
+    can report exactly how close price came, instead of only asserting that it touched.
+    """
     start = max(0, len(candles) - lookback)
     end = len(candles) - 1  # exclude the current/last candle
+    found = False
+    closest = None
+    closest_level = None
     for i in range(start, end):
         level = level_at(i)
         if level is None:
             continue
         c = candles[i]
         if (c["l"] - deviation) <= level <= (c["h"] + deviation):
-            return True
-    return False
+            found = True
+            gap = 0.0  # the candle's range actually contains the level
+        elif level > c["h"]:
+            gap = level - c["h"]
+        else:
+            gap = c["l"] - level
+        if closest is None or gap < closest:
+            closest, closest_level = gap, level
+    if return_detail:
+        return found, closest, closest_level
+    return found
 
 
 # ============================= SUPPORT / RESISTANCE (1h) =============================
@@ -435,28 +456,54 @@ def detect_sr(candles, deviation):
 
 # ============================= LINE STRIKE =============================
 def detect_line_strike(candles):
+    """3-line strike: 3 candles one way, then a 4th opposite candle that swallows them.
+
+    Returns (kind, reversal_direction, detail) where detail carries the real measurements
+    behind the call - the rejection candle's open/close, its body size, and the level it
+    had to close beyond to qualify - so the message can show evidence, not just a verdict.
+    """
     if len(candles) < 4:
-        return None, None
+        return None, None, None
     c1, c2, c3, c4 = candles[-4:]
     direction = "up" if c1["c"] > c1["o"] else "down"
     same3 = all((c["c"] > c["o"]) if direction == "up" else (c["c"] < c["o"]) for c in (c1, c2, c3))
     if not same3:
-        return None, None
+        return None, None, None
     c4dir = "up" if c4["c"] > c4["o"] else "down"
     if c4dir == direction:
-        return None, None
+        return None, None, None
+
     range_low, range_high = min(c1["l"], c2["l"], c3["l"]), max(c1["h"], c2["h"], c3["h"])
+    rev = "down" if direction == "up" else "up"
+    body = abs(c4["c"] - c4["o"])
+
     if (direction == "up" and c4["c"] < range_low) or (direction == "down" and c4["c"] > range_high):
-        return "3-line", ("down" if direction == "up" else "up")
+        needed = range_low if direction == "up" else range_high
+        return "3-line", rev, {"open": c4["o"], "close": c4["c"], "body": body,
+                                "needed": needed, "swallowed": 3}
     if (direction == "up" and c4["c"] < c3["o"]) or (direction == "down" and c4["c"] > c3["o"]):
-        return "2-line", ("down" if direction == "up" else "up")
-    return None, None
+        return "2-line", rev, {"open": c4["o"], "close": c4["c"], "body": body,
+                                "needed": c3["o"], "swallowed": 1}
+
+    # Near miss: the 3-in-a-row and an opposing 4th candle are there, but it didn't close
+    # far enough to swallow even one prior candle. Report how much short it fell.
+    shortfall = (c4["c"] - c3["o"]) if direction == "up" else (c3["o"] - c4["c"])
+    return None, rev, {"open": c4["o"], "close": c4["c"], "body": body,
+                       "needed": c3["o"], "swallowed": 0,
+                       "near_miss": True, "shortfall": abs(shortfall)}
 
 
 # ============================= RSI DIVERGENCE =============================
 def detect_divergence(candles, rsi_vals):
+    """Detect regular/hidden RSI divergence.
+
+    Also returns the exact swing prices and RSI readings that were compared, so the
+    Telegram message can show the real evidence rather than just asserting a result.
+    Shape: {"bullish": kind|None, "bearish": kind|None, "bullish_detail": {...}, ...}
+    """
     highs, lows = find_swings(candles, 3)
-    result = {"bullish": None, "bearish": None}
+    result = {"bullish": None, "bearish": None,
+              "bullish_detail": None, "bearish_detail": None}
 
     def rsi_at(i):
         return rsi_vals[i] if i < len(rsi_vals) else None
@@ -465,22 +512,39 @@ def detect_divergence(candles, rsi_vals):
         h1, h2 = highs[-2], highs[-1]
         r1, r2 = rsi_at(h1["i"]), rsi_at(h2["i"])
         if r1 is not None and r2 is not None:
+            kind = None
             if h2["price"] > h1["price"] and r2 < r1:
-                result["bearish"] = "regular"
+                kind = "regular"
             elif h2["price"] < h1["price"] and r2 > r1:
-                result["bearish"] = "hidden"
+                kind = "hidden"
+            if kind:
+                result["bearish"] = kind
+                result["bearish_detail"] = {
+                    "p1": h1["price"], "p2": h2["price"], "r1": r1, "r2": r2,
+                }
     if len(lows) >= 2:
         l1, l2 = lows[-2], lows[-1]
         r1, r2 = rsi_at(l1["i"]), rsi_at(l2["i"])
         if r1 is not None and r2 is not None:
+            kind = None
             if l2["price"] < l1["price"] and r2 > r1:
-                result["bullish"] = "regular"
+                kind = "regular"
             elif l2["price"] > l1["price"] and r2 < r1:
-                result["bullish"] = "hidden"
+                kind = "hidden"
+            if kind:
+                result["bullish"] = kind
+                result["bullish_detail"] = {
+                    "p1": l1["price"], "p2": l2["price"], "r1": r1, "r2": r2,
+                }
     return result
 
 
 # ============================= SESSION =============================
+def toPKT_str(now_utc):
+    """Current time rendered in PKT (UTC+5), for showing the real clock in messages."""
+    return (now_utc + timedelta(hours=5)).strftime("%H:%M")
+
+
 def in_session_window(now_utc):
     pkt = now_utc + timedelta(hours=5)
     mins = pkt.hour * 60 + pkt.minute
@@ -525,7 +589,7 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
     nearest_res = min((v for v in resistances if v > price), default=None)
     nearest_sup = max((v for v in supports if v < price), default=None)
 
-    strike_type, strike_rev = detect_line_strike(candles5)
+    strike_type, strike_rev, strike_detail = detect_line_strike(candles5)
     div5 = detect_divergence(candles5, rsi5)
     div15 = detect_divergence(candles15, rsi15)
     div30 = detect_divergence(candles30, rsi30)
@@ -538,19 +602,35 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
         conds = []  # CORE conditions - these drive the signal
         confluence = []  # CONFLUENCE conditions - bonus only, shown but never required
 
-        session_label = "Within trading session (7am-4pm or 8pm-11pm PKT)"
+        pkt_now = toPKT_str(now_utc)
         if bypass_session and not real_in_session:
-            session_label += " [bypassed for demo run]"
+            session_label = f"Session · <code>{pkt_now} PKT</code> <i>(demo bypass)</i>"
+        elif in_session:
+            session_label = f"Session · <code>{pkt_now} PKT</code> <i>(7-16, 20-23)</i>"
+        else:
+            session_label = f"Session <i>— <code>{pkt_now} PKT</code> is outside 7-16 / 20-23</i>"
         conds.append(("session", session_label, in_session))
-        conds.append(("ma_proximity", f"21MA(5m) within ${FAST_MA_PROXIMITY_USD} of price", ma_proximity))
+        ma_dist = abs(price - ma21) if ma21 is not None else None
+        if ma21 is None:
+            ma_label = "21MA <i>— not enough candles yet</i>"
+        else:
+            if ma_proximity:
+                ma_label = (f"21MA <code>{ma21:.2f}</code> · <code>${ma_dist:.2f}</code> "
+                            f"from price <i>(max ${FAST_MA_PROXIMITY_USD:.2f})</i>")
+            else:
+                ma_label = (f"21MA <code>{ma21:.2f}</code> · <code>${ma_dist:.2f}</code> away "
+                            f"— <b>missed by ${ma_dist - FAST_MA_PROXIMITY_USD:.2f}</b>")
+        conds.append(("ma_proximity", ma_label, ma_proximity))
 
         # --- CORE trendline: 5m and 15m only (30m demoted to confluence) ---
         # BUY = price breaks ABOVE resistance (line drawn from swing HIGHS), standard continuation.
         # SELL = price breaks BELOW support (line drawn from swing LOWS), standard continuation.
         core_tf = ([("5m", tl5up, candles5), ("15m", tl15up, candles15)] if direction == "buy" else
                    [("5m", tl5dn, candles5), ("15m", tl15dn, candles15)])
-        tl_break_pass, tl_break_desc = False, "No valid trendline break found (5m/15m)"
-        tl_retest_pass, tl_retest_desc = False, "No trendline retest to confirm (no break yet)"
+        tl_break_pass, tl_break_desc = False, "Trendline break <i>— no qualifying line broken</i>"
+        tl_retest_pass, tl_retest_desc = False, "Trendline retest <i>— awaiting a break first</i>"
+        # If nothing breaks, still report the closest line so the message shows how near it got.
+        best_near = None
         for tf, line, cands in core_tf:
             if not line:
                 continue
@@ -558,26 +638,56 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
             line_now = line_value_at(line, last_len - 1)
             if abs(line_now - price) > MAX_LINE_DISTANCE_USD:
                 continue
-            broke = (price > line_now + MIN_BREAK_USD) if direction == "buy" else (price < line_now - MIN_BREAK_USD)
-            if not broke:
+            beyond = (price - line_now) if direction == "buy" else (line_now - price)
+            if best_near is None or beyond > best_near[1]:
+                best_near = (tf, beyond, line_now, line)
+            if beyond < MIN_BREAK_USD:
                 continue
             tl_break_pass = True
-            tl_break_desc = f"Trendline break confirmed on {tf} (line ~${line_now:.2f})"
-            retested = retest_touch_found(cands, lambda i, ln=line: line_value_at(ln, i), TRENDLINE_RETEST_DEVIATION_USD)
-            if retested:
+            tl_break_desc = (f"Broke {tf} line <code>{line_now:.2f}</code> by "
+                             f"<code>${beyond:.2f}</code> <i>(min ${MIN_BREAK_USD:.2f})</i>")
+            found, gap, lvl = retest_touch_found(
+                cands, lambda i, ln=line: line_value_at(ln, i),
+                TRENDLINE_RETEST_DEVIATION_USD, return_detail=True)
+            if found:
                 tl_retest_pass = True
-                tl_retest_desc = f"Trendline retest confirmed on {tf} (within ${TRENDLINE_RETEST_DEVIATION_USD})"
+                tl_retest_desc = (f"Retested {tf} line <code>{lvl:.2f}</code> "
+                                  f"<i>(touched within ${TRENDLINE_RETEST_DEVIATION_USD:.2f})</i>")
+            elif gap is not None:
+                tl_retest_desc = (f"Retest · closest approach <code>${gap:.2f}</code> "
+                                  f"— <b>missed by ${gap - TRENDLINE_RETEST_DEVIATION_USD:.2f}</b>")
             else:
-                tl_retest_desc = f"Trendline broke on {tf} but no retest touch yet"
+                tl_retest_desc = f"Retest <i>— broke {tf}, price hasn't returned yet</i>"
             break
+        if not tl_break_pass and best_near is not None:
+            tf_n, beyond_n, lv_n, _ = best_near
+            if beyond_n >= 0:
+                tl_break_desc = (f"Break <code>{tf_n} {lv_n:.2f}</code> · only "
+                                 f"<code>${beyond_n:.2f}</code> past — "
+                                 f"<b>missed by ${MIN_BREAK_USD - beyond_n:.2f}</b>")
+            else:
+                tl_break_desc = (f"Break <code>{tf_n} {lv_n:.2f}</code> · price hasn't reached it "
+                                 f"— <b>missed by ${abs(beyond_n) + MIN_BREAK_USD:.2f}</b>")
         conds.append(("trendline_break", tl_break_desc, tl_break_pass))
         conds.append(("trendline_retest", tl_retest_desc, tl_retest_pass))
 
         # --- CORE line-strike (5m) ---
         want_rev = "up" if direction == "buy" else "down"
         strike_match = strike_type is not None and strike_rev == want_rev
-        strike_desc = (f"{'3-line strike' if strike_type=='3-line' else '2-line strike (partial)'} confirms rejection"
-                        if strike_match else "No qualifying line-strike rejection yet")
+        if strike_match and strike_detail:
+            d = strike_detail
+            kind_txt = "3-line strike" if strike_type == "3-line" else "2-line strike <i>(partial)</i>"
+            strike_desc = (f"{kind_txt} · closed <code>{d['close']:.2f}</code> past "
+                           f"<code>{d['needed']:.2f}</code>, body <code>${d['body']:.2f}</code>")
+        elif strike_match:
+            strike_desc = "3-line strike" if strike_type == "3-line" else "2-line strike <i>(partial)</i>"
+        elif (strike_detail and strike_detail.get("near_miss")
+              and strike_rev == want_rev):
+            strike_desc = (f"Strike · reversal candle closed <code>{strike_detail['close']:.2f}</code>, "
+                           f"needed <code>{strike_detail['needed']:.2f}</code> — "
+                           f"<b>missed by ${strike_detail['shortfall']:.2f}</b>")
+        else:
+            strike_desc = "Strike rejection <i>— no 3-of-a-kind reversal pattern</i>"
         conds.append(("strike", strike_desc, strike_match))
 
         # --- CORE divergence: 5m and 15m only (30m demoted to confluence) ---
@@ -585,34 +695,67 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
         core_hits = []
         for label, d in (("5m", div5), ("15m", div15)):
             if d[want_key]:
-                core_hits.append(f"{label} {d[want_key]}")
-        div_desc = f"RSI divergence: {', '.join(core_hits)}" if core_hits else "No RSI divergence in trade direction (5m/15m)"
+                det = d.get(f"{want_key}_detail")
+                if det:
+                    core_hits.append(
+                        f"{label} {d[want_key]} · price <code>{det['p1']:.2f}→{det['p2']:.2f}</code> "
+                        f"vs RSI <code>{det['r1']:.1f}→{det['r2']:.1f}</code>")
+                else:
+                    core_hits.append(f"{label} {d[want_key]}")
+        if core_hits:
+            div_desc = "RSI divergence · " + core_hits[0]
+            for extra in core_hits[1:]:
+                div_desc += f"\n      <i>+ {extra}</i>"
+        else:
+            div_desc = "RSI divergence <i>— none supporting this direction</i>"
         conds.append(("divergence", div_desc, len(core_hits) > 0))
 
         # ============= CONFLUENCE (30m trendline + 1H S&R) - bonus only =============
+        # Messages spell out WHAT happened and WHY it backs this trade direction, so the
+        # bonus section reads on its own without needing to remember the rules.
+        dir_word = "BUY" if direction == "buy" else "SELL"
         tl30 = tl30up if direction == "buy" else tl30dn
         if tl30:
             line_now_30 = line_value_at(tl30, len(candles30) - 1)
             if abs(line_now_30 - price) <= MAX_LINE_DISTANCE_USD:
                 broke_30 = (price > line_now_30 + MIN_BREAK_USD) if direction == "buy" else (price < line_now_30 - MIN_BREAK_USD)
                 if broke_30:
-                    confluence.append(("confluence_tl30_break", f"Bonus: 30m trendline break (line ~${line_now_30:.2f})", True))
+                    tl30_side = "declining resistance" if direction == "buy" else "inclining support"
+                    tl30_dir = "above" if direction == "buy" else "below"
+                    confluence.append((
+                        "confluence_tl30_break",
+                        f"<b>30m</b> broke {tl30_dir} {tl30_side} @ <code>${line_now_30:.2f}</code>",
+                        True))
                     if retest_touch_found(candles30, lambda i: line_value_at(tl30, i), TRENDLINE_RETEST_DEVIATION_USD):
-                        confluence.append(("confluence_tl30_retest", "Bonus: 30m trendline retest confirmed", True))
+                        confluence.append((
+                            "confluence_tl30_retest",
+                            "<b>30m</b> retested that line and held",
+                            True))
 
         sr_break_pass, sr_break_desc = False, None
         sr_level = None
         if direction == "buy" and nearest_res is not None and price > nearest_res + MIN_BREAK_USD:
-            sr_level, sr_break_pass, sr_break_desc = nearest_res, True, f"Bonus: 1H resistance ~${nearest_res:.2f} broken"
+            sr_level, sr_break_pass = nearest_res, True
+            sr_break_desc = f"<b>1H</b> broke above resistance @ <code>${nearest_res:.2f}</code>"
         if direction == "sell" and nearest_sup is not None and price < nearest_sup - MIN_BREAK_USD:
-            sr_level, sr_break_pass, sr_break_desc = nearest_sup, True, f"Bonus: 1H support ~${nearest_sup:.2f} broken"
+            sr_level, sr_break_pass = nearest_sup, True
+            sr_break_desc = f"<b>1H</b> broke below support @ <code>${nearest_sup:.2f}</code>"
         if sr_break_pass:
             confluence.append(("confluence_sr_break", sr_break_desc, True))
             if retest_touch_found(candles60, lambda i: sr_level, SR_DEVIATION_USD):
-                confluence.append(("confluence_sr_retest", f"Bonus: 1H level ~${sr_level:.2f} retested", True))
+                confluence.append((
+                    "confluence_sr_retest",
+                    f"<b>1H</b> retested <code>${sr_level:.2f}</code> and held",
+                    True))
 
         if div30[want_key]:
-            confluence.append(("confluence_div30", f"Bonus: 30m RSI divergence ({div30[want_key]})", True))
+            div_kind = div30[want_key]
+            div_meaning = ("momentum weakening against the old move" if div_kind == "regular"
+                           else "momentum still favouring continuation")
+            confluence.append((
+                "confluence_div30",
+                f"<b>30m</b> {div_kind} RSI divergence <i>({div_meaning})</i>",
+                True))
 
         core_passed = sum(1 for _, _, p in conds if p)
         core_total = len(conds)
@@ -661,7 +804,9 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
             ob = detect_nearest_obstacle_line(cands, obs_side, win, entry, tp)
             if ob:
                 obstacles.append(
-                    f"{label} {obs_side} trendline at ~${ob['line_now']:.2f} sits in the path to target")
+                    f"<b>{label}</b> {obs_side} <code>{ob['line_now']:.2f}</code> · "
+                    f"<code>${ob['dist_from_entry']:.2f}</code> from entry, "
+                    f"<code>${abs(tp - ob['line_now']):.2f}</code> short of target")
 
     is_risky = len(obstacles) > 0 and state in ("BUY", "SELL")
 
@@ -690,76 +835,142 @@ def send_telegram(text):
         print("Telegram send error:", e)
 
 
-def fmt(n, d=2):
-    return "—" if n is None else f"{n:.{d}f}"
+
+RULE = "━━━━━━━━━━━━━━━━━━━━"
+
+
+def _meter(passed, total):
+    """Compact filled/empty bar for the setup strength."""
+    return "█" * passed + "░" * max(0, total - passed)
+
+
+def _levels_block(res):
+    """Monospaced entry/stop/target block so the numbers line up on a phone."""
+    if res.get("entry") is None:
+        return []
+    entry, sl, tp = res["entry"], res["sl"], res["tp"]
+    risk, reward = abs(entry - sl), abs(tp - entry)
+    return [
+        f"<code>ENTRY   {entry:>9.2f}</code>",
+        f"<code>STOP    {sl:>9.2f}   -{risk:.2f}</code>",
+        f"<code>TARGET  {tp:>9.2f}   +{reward:.2f}</code>",
+    ]
+
+
+def _record_line(tp_hits, sl_hits, label="RECORD"):
+    total = tp_hits + sl_hits
+    if total == 0:
+        return f"<code>{label}</code>  <i>no closed trades yet</i>"
+    rate = (tp_hits / total) * 100
+    return f"<code>{label}</code>  {tp_hits}W · {sl_hits}L · <b>{rate:.0f}%</b>"
+
+
+def _conditions_block(res):
+    passed, total = res.get("passed", 0), res.get("total", 0)
+    if not total:
+        return ["<i>Still building candle history — no evaluation yet.</i>"]
+    out = [f"<b>SETUP</b>  {passed}/{total}  <code>{_meter(passed, total)}</code>", ""]
+    for _, label, ok in res.get("conds", []):
+        out.append(f"{'✅' if ok else '▫️'} {label}")
+    return out
+
+
+def _confluence_block(res):
+    if not res.get("confluence"):
+        return []
+    out = ["", "<b>✨ BIGGER PICTURE</b> <i>(bonus only)</i>"]
+    for _, label, _ in res["confluence"]:
+        out.append(f"   {label}")
+    return out
+
+
+def _data_warning_block(res):
+    """Data cautions shown ON the signal - never a reason to suppress it."""
+    if not res.get("data_warnings"):
+        return []
+    out = ["", "<b>⚠️ DATA CHECK</b>"]
+    for w in res["data_warnings"]:
+        out.append(f"   {w}")
+    return out
 
 
 def build_message(res):
+    """Pre-signal / demo status message."""
     state = res["state"]
-    lines = []
     if state == "BUY":
-        lines.append("🟢 <b>XAU BUY SIGNAL</b>")
+        head = "🟢 <b>BUY SIGNAL</b>"
     elif state == "SELL":
-        lines.append("🔴 <b>XAU SELL SIGNAL</b>")
+        head = "🔴 <b>SELL SIGNAL</b>"
     elif state == "PRE_BUY":
-        label = "🟠 <b>Strong pre-signal: BUY building</b>" if res.get("strong_pre") else "🟡 <b>Pre-signal: BUY building</b>"
-        lines.append(label)
+        head = ("🟠 <b>STRONG PRE-SIGNAL</b> · BUY" if res.get("strong_pre")
+                else "🟡 <b>PRE-SIGNAL</b> · BUY")
     elif state == "PRE_SELL":
-        label = "🟠 <b>Strong pre-signal: SELL building</b>" if res.get("strong_pre") else "🟡 <b>Pre-signal: SELL building</b>"
-        lines.append(label)
+        head = ("🟠 <b>STRONG PRE-SIGNAL</b> · SELL" if res.get("strong_pre")
+                else "🟡 <b>PRE-SIGNAL</b> · SELL")
+    elif state == "WARMING_UP":
+        head = "⏳ <b>WARMING UP</b>"
+    else:
+        head = "⚪️ <b>NO TRADE</b>"
 
-    lines.append(f"Price: ${fmt(res['price'])}")
-    if res.get("entry") is not None:
-        lines.append(f"Entry: ${fmt(res['entry'])} | SL: ${fmt(res['sl'])} | TP: ${fmt(res['tp'])}")
-    lines.append(f"Core conditions met: {res['passed']}/{res['total']} (5m/15m)")
-    lines.append("")
-    for _, label, passed in res["conds"]:
-        lines.append(f"{'✅' if passed else '▫️'} {label}")
-    if res.get("confluence"):
-        lines.append("")
-        lines.append(f"✨ <b>Confluence (30m/1H, bonus):</b>")
-        for _, label, _ in res["confluence"]:
-            lines.append(f"✨ {label}")
+    price = res.get("price")
+    price_txt = f"<code>${price:.2f}</code>" if price is not None else "<i>n/a</i>"
+    lines = [head, RULE, f"<b>XAU/USD</b>   {price_txt}"]
+
+    levels = _levels_block(res)
+    if levels:
+        lines += [RULE] + levels
+
+    lines += _data_warning_block(res)
+    lines += [RULE, ""] + _conditions_block(res) + _confluence_block(res)
     return "\n".join(lines)
 
 
 def build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits):
-    """Message for a CONFIRMED (not pre-) BUY/SELL, including its signal number and
-    the running TP/SL tally as it stood *before* this trade resolves."""
-    emoji = "🟢" if res["state"] == "BUY" else "🔴"
-    risky_tag = " (Risky)" if res.get("is_risky") else ""
-    tracker = "Risky signal" if res.get("is_risky") else "Signal"
-    lines = [f"{emoji} <b>XAU {res['state']}{risky_tag} — {tracker} #{signal_number}</b>",
-             f"(so far: TP hit: {tp_hits}, SL hit: {sl_hits})",
-             ""]
+    """Confirmed BUY/SELL - carries its signal number and running record."""
+    if res.get("is_risky"):
+        head = (f"🟢 <b>BUY</b> <i>(Risky)</i> · <b>#{signal_number}</b>" if res["state"] == "BUY"
+                else f"🔴 <b>SELL</b> <i>(Risky)</i> · <b>#{signal_number}</b>")
+    else:
+        head = (f"🟢 <b>BUY SIGNAL</b> · <b>#{signal_number}</b>" if res["state"] == "BUY"
+                else f"🔴 <b>SELL SIGNAL</b> · <b>#{signal_number}</b>")
+
+    lines = [head, RULE, f"<b>XAU/USD</b>   <code>${res['price']:.2f}</code>"]
+
+    levels = _levels_block(res)
+    if levels:
+        lines += [RULE] + levels
+
     if res.get("obstacles"):
-        lines.append("⚠️ <b>Risk reasons:</b>")
+        lines += [RULE, "<b>⚠️ RISK</b>"]
         for o in res["obstacles"]:
-            lines.append(f"⚠️ {o}")
-        lines.append("")
-    lines += [f"Price: ${fmt(res['price'])}",
-              f"Entry: ${fmt(res['entry'])} | SL: ${fmt(res['sl'])} | TP: ${fmt(res['tp'])}",
-              f"Core conditions met: {res['passed']}/{res['total']} (5m/15m)",
-              ""]
-    for _, label, passed in res["conds"]:
-        lines.append(f"{'✅' if passed else '▫️'} {label}")
-    if res.get("confluence"):
-        lines.append("")
-        lines.append("✨ <b>Confluence (30m/1H, bonus):</b>")
-        for _, label, _ in res["confluence"]:
-            lines.append(f"✨ {label}")
+            lines.append(f"   {o}")
+
+    lines += _data_warning_block(res)
+    lines += [RULE, ""] + _conditions_block(res) + _confluence_block(res)
+    label = "RISKY" if res.get("is_risky") else "RECORD"
+    lines += ["", RULE, _record_line(tp_hits, sl_hits, label)]
     return "\n".join(lines)
 
 
 def build_outcome_message(trade, outcome, tp_hits, sl_hits):
-    result = "✅ TP HIT" if outcome == "TP" else "❌ SL HIT"
+    """Follow-up sent once a tracked signal resolves."""
+    won = outcome == "TP"
     kind = trade.get("kind", "confirmed")
     kind_label = {"confirmed": "Signal", "risky": "Risky signal", "pre": "Pre-signal"}.get(kind, "Signal")
+    head = (f"✅ <b>TARGET HIT</b> · {kind_label} #{trade['signal_number']}" if won
+            else f"❌ <b>STOPPED OUT</b> · {kind_label} #{trade['signal_number']}")
+    moved = abs(trade["tp"] - trade["entry"]) if won else -abs(trade["entry"] - trade["sl"])
+    record_label = {"confirmed": "RECORD", "risky": "RISKY", "pre": "PRE"}.get(kind, "RECORD")
     return "\n".join([
-        f"📊 <b>{kind_label} #{trade['signal_number']} result: {result}</b>",
-        f"{trade['dir']} | Entry ${fmt(trade['entry'])} | SL ${fmt(trade['sl'])} | TP ${fmt(trade['tp'])}",
-        f"{kind_label} running total — TP hit: {tp_hits}, SL hit: {sl_hits}",
+        head,
+        RULE,
+        f"<code>{trade['dir']:<6} {trade['entry']:>9.2f}</code>",
+        f"<code>RESULT {moved:>+9.2f}</code>",
+        RULE,
+        _record_line(tp_hits, sl_hits, record_label),
     ])
+
+
 
 
 # ============================= TRADE OUTCOME TRACKING =============================
@@ -786,12 +997,121 @@ def resolve_trade(trade, candles5):
     return None  # not resolved yet
 
 
-def process_pending_trades(candles5, state_store):
+# A trade older than this can never resolve - the data feed only retains ~48h, so once
+# it scrolls out of the window we'd re-scan it forever and state.json would grow unbounded.
+TRADE_EXPIRY_HOURS = 36
+
+
+def check_data_sanity(points, spot, candles5, state_store, now_utc):
+    """Inspect the incoming data before trusting it.
+
+    Returns (fatal_reason, warnings).
+      fatal_reason -> a string only when the data is genuinely UNUSABLE (nothing to
+                      evaluate anyway, so no trade can be lost by stopping).
+      warnings     -> list of strings attached to the signal as a caution. These NEVER
+                      block a signal: in a break-and-retest strategy a fast move is the
+                      setup, not an error, so refusing to trade on it would be backwards.
+    """
+    warnings = []
+
+    # ---- FATAL: nothing usable to evaluate ----
+    if not points:
+        return "price feed returned no data", warnings
+    if not candles5:
+        return "could not build any candles from the feed", warnings
+    latest = candles5[-1]["c"]
+    if latest is None or latest <= 0:
+        return f"latest price is invalid ({latest})", warnings
+
+    # ---- WARN: stale feed ----
+    newest_ms = candles5[-1]["t"]
+    age_min = (now_utc.timestamp() * 1000 - newest_ms) / 60000.0
+    if age_min > DATA_STALE_WARN_MINUTES:
+        warnings.append(f"feed looks stale — newest candle is {age_min:.0f} min old")
+
+    # ---- WARN: spot vs candle disagreement ----
+    spot_price = (spot or {}).get("spot_usd_oz")
+    if spot_price:
+        diff = abs(spot_price - latest)
+        if diff > DATA_SPOT_MISMATCH_WARN:
+            warnings.append(
+                f"feed disagrees with itself — spot ${spot_price:.2f} vs candle ${latest:.2f} "
+                f"(${diff:.2f} apart)")
+
+    # ---- WARN: large jump since the previous scan ----
+    prev = state_store.get("last_seen_price")
+    if prev:
+        pct = abs(latest - prev) / prev * 100.0
+        if pct > DATA_JUMP_WARN_PCT:
+            warnings.append(
+                f"price moved {pct:.1f}% since last scan (${prev:.2f} → ${latest:.2f}) — "
+                f"could be a real move or bad data, verify on MT5")
+
+    # ---- WARN: thin history ----
+    if len(candles5) < 100:
+        warnings.append(f"only {len(candles5)} 5m candles available — indicators may be unreliable")
+
+    return None, warnings
+
+
+def should_send_warning(state_store, now_utc):
+    """Rate-limit warning alerts so a flaky feed can't spam you every 5 minutes."""
+    last = state_store.get("last_warn_ms")
+    now_ms = now_utc.timestamp() * 1000
+    if last and (now_ms - last) < DATA_WARN_COOLDOWN_MINUTES * 60000:
+        return False
+    state_store["last_warn_ms"] = now_ms
+    return True
+
+
+def build_heartbeat_message(res, state_store, now_utc):
+    """Daily 'I'm alive' summary so silence is never ambiguous."""
+    price = res.get("price")
+    price_txt = f"<code>${price:.2f}</code>" if price else "<i>n/a</i>"
+    lines = [
+        "💚 <b>DAILY CHECK-IN</b>",
+        RULE,
+        f"<b>XAU/USD</b>   {price_txt}",
+        f"<code>{toPKT_str(now_utc)} PKT</code>",
+        RULE,
+        _record_line(state_store.get("tp_hits", 0), state_store.get("sl_hits", 0), "SIGNALS"),
+        _record_line(state_store.get("risky_tp_hits", 0), state_store.get("risky_sl_hits", 0), "RISKY  "),
+        _record_line(state_store.get("pre_tp_hits", 0), state_store.get("pre_sl_hits", 0), "PRE    "),
+        RULE,
+        f"<code>FIRED  </code>  {state_store.get('signal_counter', 0)} signals · "
+        f"{state_store.get('risky_counter', 0)} risky · {state_store.get('pre_counter', 0)} pre",
+        f"<code>OPEN   </code>  {len(state_store.get('pending_trades', []))} trades awaiting TP/SL",
+    ]
+    return "\n".join(lines)
+
+
+def maybe_send_heartbeat(res, state_store, now_utc):
+    """Fire once per calendar day, regardless of how many loop iterations run."""
+    pkt = now_utc + timedelta(hours=5)
+    today = pkt.strftime("%Y-%m-%d")
+    if state_store.get("last_heartbeat_date") == today:
+        return
+    if pkt.hour < HEARTBEAT_HOUR_PKT:
+        return
+    send_telegram(build_heartbeat_message(res, state_store, now_utc))
+    state_store["last_heartbeat_date"] = today
+
+
+def process_pending_trades(candles5, state_store, now_utc=None):
     pending = state_store.get("pending_trades", [])
     still_pending = []
+    now_ms = int((now_utc or datetime.now(timezone.utc)).timestamp() * 1000)
+    expiry_ms = TRADE_EXPIRY_HOURS * 3600 * 1000
     for trade in pending:
         outcome = resolve_trade(trade, candles5)
         if outcome is None:
+            age = now_ms - trade.get("opened_at_ms", now_ms)
+            if age > expiry_ms:
+                # Neither TP nor SL was reached inside the data window - drop it rather
+                # than tracking it forever. Not counted as a win or a loss.
+                print(f"Expiring unresolved trade #{trade.get('signal_number')} "
+                      f"({trade.get('kind')}) after {age/3600000:.0f}h")
+                continue
             still_pending.append(trade)
             continue
         kind = trade.get("kind", "confirmed")
@@ -847,15 +1167,20 @@ def main():
     is_manual_run = (os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
                      and scan_iteration == "1")
 
-    if not in_session_window(now_utc) and not is_manual_run:
-        print("Outside trading session window (PKT). Skipping this run.")
-        return
+    in_session = in_session_window(now_utc)
+    state_store = load_state()
 
+    # The heartbeat should fire even outside session hours, so fetch first and gate later.
     try:
         points = fetch_intraday()
         spot = fetch_spot()
     except Exception as e:
         print("Data fetch failed:", e)
+        # A persistent outage is worth knowing about; the cooldown stops it spamming.
+        if should_send_warning(state_store, now_utc):
+            send_telegram(f"⚠️ <b>Data feed unreachable</b>\n{RULE}\n<i>{e}</i>\n"
+                          f"Scanning will resume automatically when the feed returns.")
+            save_state(state_store)
         sys.exit(0)  # don't fail the workflow on a transient API hiccup
 
     candles5 = build_candles(points, 5)
@@ -863,7 +1188,32 @@ def main():
     candles30 = build_candles(points, 30)
     candles60 = build_candles(points, 60)
 
+    # --- Data sanity: fatal only when there is genuinely nothing to evaluate ---
+    fatal, data_warnings = check_data_sanity(points, spot, candles5, state_store, now_utc)
+    if fatal:
+        print("Data unusable:", fatal)
+        if should_send_warning(state_store, now_utc):
+            send_telegram(f"⚠️ <b>Data problem — scanning paused</b>\n{RULE}\n<i>{fatal}</i>\n"
+                          f"No signals will fire until this clears.")
+        save_state(state_store)
+        return
+
+    if candles5:
+        state_store["last_seen_price"] = candles5[-1]["c"]
+
     res = evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=is_manual_run)
+    res["data_warnings"] = data_warnings
+
+    # Daily check-in runs regardless of session, so silence is never ambiguous.
+    maybe_send_heartbeat(res, state_store, now_utc)
+
+    if not in_session and not is_manual_run:
+        print("Outside trading session window (PKT). Skipping evaluation.")
+        save_state(state_store)
+        return
+
+    if data_warnings:
+        print("Data warnings:", "; ".join(data_warnings))
     print("Evaluated state:", res.get("state"), "| spot:", spot.get("spot_usd_oz"))
 
     if res.get("state") == "WARMING_UP":
@@ -873,11 +1223,9 @@ def main():
         print("Still warming up, not enough candle history yet.")
         return
 
-    state_store = load_state()
-
     # Check any open confirmed signals for TP/SL resolution first, regardless of current state.
     if not is_manual_run:
-        process_pending_trades(candles5, state_store)
+        process_pending_trades(candles5, state_store, now_utc)
 
     last_state = state_store.get("last_state", "NONE")
     current_state = res.get("state")
@@ -920,7 +1268,8 @@ def main():
         pre_tp, pre_sl = state_store.get("pre_tp_hits", 0), state_store.get("pre_sl_hits", 0)
 
         msg = build_message(res)
-        msg += f"\n\n<i>Pre-signal #{pre_number} (so far: TP hit: {pre_tp}, SL hit: {pre_sl})</i>"
+        msg += "\n\n" + RULE + "\n" + f"<code>PRE #{pre_number}</code>  " + \
+               _record_line(pre_tp, pre_sl, "PRE").split("</code>", 1)[-1].strip()
         send_telegram(msg)
 
         if res.get("entry") is not None:
