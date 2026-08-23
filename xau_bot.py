@@ -135,6 +135,24 @@ def build_candles(points, interval_min):
 
 
 # ============================= INDICATORS =============================
+def smma(vals, period):
+    """Smoothed Moving Average - matches MT5's MA method 'Smoothed' (SMMA/Wilder's).
+
+    MT5 seeds the first value with a simple average of the first `period` values, then:
+        SMMA[i] = (SMMA[i-1] * (period - 1) + value[i]) / period
+
+    This is NOT the same as a Simple MA: old data is never fully discarded, so SMMA
+    reacts more slowly and sits further from price in a trend. Using SMA here was making
+    the bot's 21MA disagree with the chart.
+    """
+    if len(vals) < period:
+        return None
+    val = sum(vals[:period]) / period  # seed
+    for v in vals[period:]:
+        val = (val * (period - 1) + v) / period
+    return val
+
+
 def sma(vals, period):
     if len(vals) < period:
         return None
@@ -561,9 +579,10 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
 
     price = candles5[-1]["c"]
     closes5 = [c["c"] for c in candles5]
-    ma21 = sma(closes5, 21)
-    ma50 = sma(closes5, 50)
-    ma200 = sma(closes5, min(200, len(closes5)))
+    # MT5 chart is set to Method=Smoothed, Apply to=Close, Shift=0 - so use SMMA, not SMA.
+    ma21 = smma(closes5, 21)
+    ma50 = smma(closes5, 50)
+    ma200 = smma(closes5, min(200, len(closes5)))
     rsi5 = rsi_series(closes5, RSI_PERIOD)
     rsi15 = rsi_series([c["c"] for c in candles15], RSI_PERIOD)
     rsi30 = rsi_series([c["c"] for c in candles30], RSI_PERIOD)
