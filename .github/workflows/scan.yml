@@ -32,14 +32,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Continuous scan loop (every 5 min for ~55 min)
+      - name: Continuous scan loop (aligned to 5m candle closes, ~55 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
+          # Scans are aligned to the 5-minute clock boundaries that candles close on
+          # (:00 :05 :10 ...), plus a short buffer so the feed has delivered the closing
+          # tick. A fixed "sleep 300" would drift relative to those boundaries and could
+          # land mid-candle, delaying detection by up to a full interval.
+          BUFFER=20
           END=$(( $(date +%s) + 55*60 ))
           ITER=0
+
           while [ "$(date +%s)" -lt "$END" ]; do
             ITER=$((ITER+1))
             echo "--- scan iteration $ITER at $(date -u '+%H:%M:%S UTC') ---"
@@ -55,11 +61,21 @@ jobs:
               git push || echo "push failed, will retry next iteration"
             fi
 
-            # Stop if the next sleep would overrun our window.
-            if [ $(( $(date +%s) + 300 )) -ge "$END" ]; then
+            # Sleep until just after the NEXT 5-minute boundary.
+            NOW=$(date +%s)
+            SECS_PAST=$(( NOW % 300 ))
+            SLEEP_FOR=$(( 300 - SECS_PAST + BUFFER ))
+            # If we're already inside the buffer of a fresh boundary, wait for the next one.
+            if [ "$SLEEP_FOR" -le "$BUFFER" ]; then
+              SLEEP_FOR=$(( SLEEP_FOR + 300 ))
+            fi
+
+            NEXT=$(( NOW + SLEEP_FOR ))
+            if [ "$NEXT" -ge "$END" ]; then
               echo "window ending, exiting loop"
               break
             fi
-            sleep 300
+            echo "sleeping ${SLEEP_FOR}s until $(date -u -d "@${NEXT}" '+%H:%M:%S UTC')"
+            sleep "$SLEEP_FOR"
           done
           echo "Loop finished after $ITER scans."
