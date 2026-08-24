@@ -1,23 +1,33 @@
 {
-  "last_state": "NONE",
+  "last_state": "PRE_BUY",
   "last_signal_time": "2026-08-19T09:28:17.498235+00:00",
   "signal_counter": 0,
   "tp_hits": 0,
   "sl_hits": 0,
-  "pending_trades": [],
+  "pending_trades": [
+    {
+      "signal_number": 1,
+      "dir": "BUY",
+      "kind": "strong_pre",
+      "entry": 4646.899902,
+      "sl": 4641.233283909653,
+      "tp": 4652.566520090347,
+      "opened_at_ms": 1787568020366
+    }
+  ],
   "risky_counter": 0,
   "risky_tp_hits": 0,
   "risky_sl_hits": 0,
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4645,
+  "last_seen_price": 4646.899902,
   "last_heartbeat_date": "2026-08-23",
   "last_warn_ms": 1787514320452.5261,
   "counters": {
     "confirmed": 0,
     "risky": 0,
-    "strong_pre": 0,
+    "strong_pre": 1,
     "pre": 0
   },
   "records": {
@@ -97,7 +107,7 @@
         ]
       },
       "date": "2026-08-24",
-      "fired": 0
+      "fired": 1
     }
   }
 }
