@@ -609,13 +609,20 @@ def in_session_window(now_utc):
 def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=False):
     # Report WHICH timeframe is short and by how much - a bare "warming up" tells us
     # nothing when the real cause is a degraded feed returning too few ticks.
-    need = {"5m": (len(candles5), 60), "15m": (len(candles15), 40),
-            "30m": (len(candles30), 30), "1H": (len(candles60), 20)}
-    short = [f"{tf} {have}/{req}" for tf, (have, req) in need.items() if have < req]
-    if short:
+    # Only the CORE timeframes can block evaluation. 30m and 1H feed confluence and the
+    # obstacle map, both of which are explicitly non-blocking by design - if the feed is
+    # returning thin history, those checks degrade to "not found" rather than stopping
+    # the whole scan. Blocking on them contradicted the core/confluence split.
+    core_need = {"5m": (len(candles5), 60), "15m": (len(candles15), 40)}
+    aux_need = {"30m": (len(candles30), 30), "1H": (len(candles60), 20)}
+    all_need = {**core_need, **aux_need}
+    core_short = [f"{tf} {have}/{req}" for tf, (have, req) in core_need.items() if have < req]
+    if core_short:
         return {"state": "WARMING_UP",
-                "warmup_detail": ", ".join(f"{tf} {have}/{req}" for tf, (have, req) in need.items()),
-                "warmup_short": ", ".join(short)}
+                "warmup_detail": ", ".join(f"{tf} {have}/{req}" for tf, (have, req) in all_need.items()),
+                "warmup_short": ", ".join(core_short)}
+
+    thin_aux = [f"{tf} {have}/{req}" for tf, (have, req) in aux_need.items() if have < req]
 
     price = candles5[-1]["c"]
     closes5 = [c["c"] for c in candles5]
@@ -875,6 +882,7 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
         "confluence": chosen["confluence"], "confluence_count": chosen["confluence_count"],
         "strong_pre": chosen["strong_pre"],
         "obstacles": obstacles, "is_risky": is_risky,
+        "thin_aux": thin_aux,
         "indicators": {"ma21": ma21, "ma50": ma50, "ma200": ma200,
                        "rsi": rsi5[-1] if rsi5 else None, "atr": atr5, "in_session": in_session},
     }
@@ -1392,6 +1400,10 @@ def main():
         state_store["last_seen_price"] = candles5[-1]["c"]
 
     res = evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=is_manual_run)
+    if res.get("thin_aux"):
+        data_warnings = list(data_warnings) + [
+            "limited higher-timeframe history (" + ", ".join(res["thin_aux"]) +
+            ") — 30m/1H confluence and obstacle checks may be incomplete"]
     res["data_warnings"] = data_warnings
     # The decision is made on the last CLOSED candle; carry the live spot through too so the
     # message can show both without ever letting the live tick affect the logic.
