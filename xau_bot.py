@@ -1002,11 +1002,13 @@ def build_outcome_message(trade, outcome, tp_hits, sl_hits):
     """Follow-up sent once a tracked signal resolves."""
     won = outcome == "TP"
     kind = trade.get("kind", "confirmed")
-    kind_label = {"confirmed": "Signal", "risky": "Risky signal", "pre": "Pre-signal"}.get(kind, "Signal")
+    kind_label = {"confirmed": "Signal", "risky": "Risky signal",
+                  "strong_pre": "Strong pre-signal", "pre": "Pre-signal"}.get(kind, "Signal")
     head = (f"✅ <b>TARGET HIT</b> · {kind_label} #{trade['signal_number']}" if won
             else f"❌ <b>STOPPED OUT</b> · {kind_label} #{trade['signal_number']}")
     moved = abs(trade["tp"] - trade["entry"]) if won else -abs(trade["entry"] - trade["sl"])
-    record_label = {"confirmed": "RECORD", "risky": "RISKY", "pre": "PRE"}.get(kind, "RECORD")
+    record_label = {"confirmed": "RECORD", "risky": "RISKY",
+                    "strong_pre": "STRONG PRE", "pre": "PRE"}.get(kind, "RECORD")
     return "\n".join([
         head,
         RULE,
@@ -1110,23 +1112,109 @@ def should_send_warning(state_store, now_utc):
     return True
 
 
+def register_signal(state_store, res, kind, direction, now_utc, pre_style=False):
+    """Number a signal, send it, and queue it for TP/SL resolution.
+
+    Each of the four kinds has its own sequential counter and its own win/loss book,
+    so a risky signal never dilutes the confirmed record and vice versa.
+    """
+    number = state_store["counters"].get(kind, 0) + 1
+    state_store["counters"][kind] = number
+
+    side = "buy" if direction.upper() == "BUY" else "sell"
+    w, l = state_store["records"]["alltime"][side].get(kind, [0, 0])
+
+    if pre_style:
+        msg = build_message(res)
+        msg += "\n\n" + RULE + "\n" + _record_line(w, l, KIND_LABELS[kind].upper()[:9]) + \
+               f"  <i>#{number}</i>"
+        send_telegram(msg)
+    else:
+        send_telegram(build_confirmed_signal_message(res, number, w, l))
+
+    state_store["records"]["today"]["fired"] = state_store["records"]["today"].get("fired", 0) + 1
+
+    if res.get("entry") is not None:
+        state_store.setdefault("pending_trades", []).append({
+            "signal_number": number, "dir": direction, "kind": kind,
+            "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
+            "opened_at_ms": int(now_utc.timestamp() * 1000),
+        })
+
+
+def _pct(w, l):
+    t = w + l
+    return f"{(w / t * 100):.0f}%" if t else "—"
+
+
+# Every table row is built to identical column widths so the W / L / % columns line up
+# down the whole report, regardless of indent level.
+_LABEL_COL = 14   # label field, indent included
+_TABLE_W = _LABEL_COL + 11   # label + "  0W   0L" + pct
+
+
+def _rec_row(label, w, l, indent=2):
+    """One aligned table row. The indent lives INSIDE the label column, so a nested row
+    and a total row still share the same W/L/% positions."""
+    text = " " * indent + label
+    return f"<code>{text:<{_LABEL_COL}}{w:>3}W {l:>3}L {_pct(w, l):>5}</code>"
+
+
+def _sub_head(text):
+    return f"<code>{text}</code>"
+
+
+def _period_block(title, period):
+    """One TODAY or ALL TIME section: buy breakdown, sell breakdown, then totals."""
+    out = [f"<b>{title}</b>", "", _sub_head("▲ BUY")]
+    for k in SIGNAL_KINDS:
+        w, l = period["buy"].get(k, [0, 0])
+        out.append(_rec_row(KIND_LABELS[k], w, l))
+    out += ["", _sub_head("▼ SELL")]
+    for k in SIGNAL_KINDS:
+        w, l = period["sell"].get(k, [0, 0])
+        out.append(_rec_row(KIND_LABELS[k], w, l))
+
+    bw = sum(period["buy"].get(k, [0, 0])[0] for k in SIGNAL_KINDS)
+    bl = sum(period["buy"].get(k, [0, 0])[1] for k in SIGNAL_KINDS)
+    sw = sum(period["sell"].get(k, [0, 0])[0] for k in SIGNAL_KINDS)
+    sl = sum(period["sell"].get(k, [0, 0])[1] for k in SIGNAL_KINDS)
+
+    out += ["", f"<code>{'─' * _TABLE_W}</code>",
+            _rec_row("BUY", bw, bl, indent=0),
+            _rec_row("SELL", sw, sl, indent=0),
+            _rec_row("COMBINED", bw + sw, bl + sl, indent=0)]
+    return out
+
+
 def build_heartbeat_message(res, state_store, now_utc):
-    """Daily 'I'm alive' summary so silence is never ambiguous."""
+    """End-of-day report: headline result first, then the full breakdown."""
+    pkt = now_utc + timedelta(hours=5)
+    rec = state_store["records"]
+    today, alltime = rec["today"], rec["alltime"]
+
+    tw = sum(today[side].get(k, [0, 0])[0] for side in ("buy", "sell") for k in SIGNAL_KINDS)
+    tl = sum(today[side].get(k, [0, 0])[1] for side in ("buy", "sell") for k in SIGNAL_KINDS)
+
     price = res.get("price")
-    price_txt = f"<code>${price:.2f}</code>" if price else "<i>n/a</i>"
+    price_txt = f"${price:.2f}" if price else "n/a"
+
     lines = [
-        "💚 <b>DAILY CHECK-IN</b>",
+        "📈 <b>DAILY REPORT</b>",
+        f"<i>{pkt.strftime('%a %d %b %Y')} · {pkt.strftime('%H:%M')} PKT</i>",
         RULE,
-        f"<b>XAU/USD</b>   {price_txt}",
-        f"<code>{toPKT_str(now_utc)} PKT</code>",
+        f"<code>{'XAU/USD':<{_LABEL_COL}}{price_txt:>9}</code>",
+        _rec_row("TODAY", tw, tl, indent=0),
         RULE,
-        _record_line(state_store.get("tp_hits", 0), state_store.get("sl_hits", 0), "SIGNALS"),
-        _record_line(state_store.get("risky_tp_hits", 0), state_store.get("risky_sl_hits", 0), "RISKY  "),
-        _record_line(state_store.get("pre_tp_hits", 0), state_store.get("pre_sl_hits", 0), "PRE    "),
-        RULE,
-        f"<code>FIRED  </code>  {state_store.get('signal_counter', 0)} signals · "
-        f"{state_store.get('risky_counter', 0)} risky · {state_store.get('pre_counter', 0)} pre",
-        f"<code>OPEN   </code>  {len(state_store.get('pending_trades', []))} trades awaiting TP/SL",
+        "",
+    ]
+    lines += _period_block("TODAY", today)
+    lines += ["", RULE, ""]
+    lines += _period_block("ALL TIME", alltime)
+    lines += [
+        "", RULE,
+        f"<i>Fired today: {today.get('fired', 0)}  ·  "
+        f"Open: {len(state_store.get('pending_trades', []))}</i>",
     ]
     return "\n".join(lines)
 
@@ -1161,23 +1249,30 @@ def process_pending_trades(candles5, state_store, now_utc=None):
             still_pending.append(trade)
             continue
         kind = trade.get("kind", "confirmed")
-        if kind == "risky":
-            tp_key, sl_key = "risky_tp_hits", "risky_sl_hits"
-        elif kind == "pre":
-            tp_key, sl_key = "pre_tp_hits", "pre_sl_hits"
-        else:
-            tp_key, sl_key = "tp_hits", "sl_hits"
-
-        if outcome == "TP":
-            state_store[tp_key] = state_store.get(tp_key, 0) + 1
-        else:
-            state_store[sl_key] = state_store.get(sl_key, 0) + 1
-        send_telegram(build_outcome_message(trade, outcome,
-                                            state_store.get(tp_key, 0), state_store.get(sl_key, 0)))
+        won = (outcome == "TP")
+        record_result(state_store, trade.get("dir", "BUY"), kind, won)
+        side = "buy" if trade.get("dir", "BUY").upper() == "BUY" else "sell"
+        w, l = state_store["records"]["alltime"][side].get(kind, [0, 0])
+        send_telegram(build_outcome_message(trade, outcome, w, l))
     state_store["pending_trades"] = still_pending
 
 
 # ============================= STATE PERSISTENCE =============================
+# The four signal kinds, each independently numbered and scored.
+SIGNAL_KINDS = ["confirmed", "risky", "strong_pre", "pre"]
+KIND_LABELS = {"confirmed": "Confirmed", "risky": "Risky",
+               "strong_pre": "Strong pre", "pre": "Pre-signal"}
+
+
+def _empty_side():
+    """Win/loss pair for every signal kind on one side of the market."""
+    return {k: [0, 0] for k in SIGNAL_KINDS}
+
+
+def _empty_period():
+    return {"buy": _empty_side(), "sell": _empty_side()}
+
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -1185,18 +1280,41 @@ def load_state():
     except Exception:
         data = {}
     data.setdefault("last_state", "NONE")
-    # Three independent trackers: confirmed signals, risky signals, and pre-signals
-    data.setdefault("signal_counter", 0)
-    data.setdefault("tp_hits", 0)
-    data.setdefault("sl_hits", 0)
-    data.setdefault("risky_counter", 0)
-    data.setdefault("risky_tp_hits", 0)
-    data.setdefault("risky_sl_hits", 0)
-    data.setdefault("pre_counter", 0)
-    data.setdefault("pre_tp_hits", 0)
-    data.setdefault("pre_sl_hits", 0)
+
+    # One sequential counter per signal kind.
+    counters = data.setdefault("counters", {})
+    for k in SIGNAL_KINDS:
+        counters.setdefault(k, 0)
+
+    # Results split by period -> direction -> kind -> [wins, losses].
+    records = data.setdefault("records", {})
+    records.setdefault("alltime", _empty_period())
+    today = records.setdefault("today", _empty_period())
+    today.setdefault("date", None)
+    today.setdefault("fired", 0)
+
     data.setdefault("pending_trades", [])
     return data
+
+
+def roll_today_if_new_day(state_store, now_utc):
+    """Reset the TODAY block when the PKT calendar date changes."""
+    pkt_date = (now_utc + timedelta(hours=5)).strftime("%Y-%m-%d")
+    today = state_store["records"]["today"]
+    if today.get("date") != pkt_date:
+        fresh = _empty_period()
+        fresh["date"] = pkt_date
+        fresh["fired"] = 0
+        state_store["records"]["today"] = fresh
+
+
+def record_result(state_store, direction, kind, won):
+    """Credit a resolved trade to both the today and all-time books."""
+    side = "buy" if direction.upper() == "BUY" else "sell"
+    idx = 0 if won else 1
+    for period in ("today", "alltime"):
+        book = state_store["records"][period][side].setdefault(kind, [0, 0])
+        book[idx] += 1
 
 
 def save_state(state):
@@ -1215,6 +1333,7 @@ def main():
 
     in_session = in_session_window(now_utc)
     state_store = load_state()
+    roll_today_if_new_day(state_store, now_utc)
 
     # The heartbeat should fire even outside session hours, so fetch first and gate later.
     try:
@@ -1256,7 +1375,9 @@ def main():
     res["live_spot"] = (spot or {}).get("spot_usd_oz")
 
     # Daily check-in runs regardless of session, so silence is never ambiguous.
-    maybe_send_heartbeat(res, state_store, now_utc)
+    # Skipped on manual runs - a test shouldn't consume or duplicate the day's heartbeat.
+    if not is_manual_run:
+        maybe_send_heartbeat(res, state_store, now_utc)
 
     if not in_session and not is_manual_run:
         print("Outside trading session window (PKT). Skipping evaluation.")
@@ -1282,54 +1403,36 @@ def main():
     current_state = res.get("state")
 
     if is_manual_run:
-        # Manual/demo run: always send a status message so you can confirm Telegram delivery,
-        # regardless of whether the state actually changed. Demo runs do NOT register signals
-        # or affect the TP/SL tally, so testing never pollutes your real track record.
-        prefix = "🧪 <b>Demo run</b>\n\n" if current_state == "NO_TRADE" else ""
-        send_telegram(prefix + build_message(res))
+        # Manual/demo run: render EXACTLY what a real signal would look like - risky label,
+        # risk reasons, entry/SL/TP, and the record line - so a test shows the full picture.
+        # Nothing is registered: no counter is incremented and no tally is touched, and this
+        # branch returns without saving state at all.
+        if current_state in ("BUY", "SELL"):
+            kind = "risky" if res.get("is_risky") else "confirmed"
+            side = "buy" if current_state == "BUY" else "sell"
+            would_be_number = state_store["counters"].get(kind, 0) + 1
+            w, l = state_store["records"]["alltime"][side].get(kind, [0, 0])
+            body = build_confirmed_signal_message(res, would_be_number, w, l)
+            send_telegram("🧪 <b>Demo run</b> <i>(not registered — counters unchanged)</i>\n\n" + body)
+        else:
+            prefix = "🧪 <b>Demo run</b>\n\n"
+            send_telegram(prefix + build_message(res))
         print("Manual run: notification sent regardless of state change.")
         return
 
     if current_state in ("BUY", "SELL") and current_state != last_state:
-        is_risky = res.get("is_risky", False)
-        if is_risky:
-            counter_key, tp_key, sl_key, kind = "risky_counter", "risky_tp_hits", "risky_sl_hits", "risky"
-        else:
-            counter_key, tp_key, sl_key, kind = "signal_counter", "tp_hits", "sl_hits", "confirmed"
-
-        tp_hits, sl_hits = state_store.get(tp_key, 0), state_store.get(sl_key, 0)
-        signal_number = state_store.get(counter_key, 0) + 1
-        state_store[counter_key] = signal_number
-
-        send_telegram(build_confirmed_signal_message(res, signal_number, tp_hits, sl_hits))
-
-        state_store.setdefault("pending_trades", []).append({
-            "signal_number": signal_number, "dir": current_state, "kind": kind,
-            "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
-            "opened_at_ms": int(now_utc.timestamp() * 1000),
-        })
+        kind = "risky" if res.get("is_risky") else "confirmed"
+        register_signal(state_store, res, kind, current_state, now_utc)
         state_store["last_state"] = current_state
         state_store["last_signal_time"] = now_utc.isoformat()
         save_state(state_store)
 
     elif current_state in ("PRE_BUY", "PRE_SELL") and current_state != last_state:
-        # Pre-signals get their own independent counter and TP/SL tracker.
-        pre_number = state_store.get("pre_counter", 0) + 1
-        state_store["pre_counter"] = pre_number
-        pre_tp, pre_sl = state_store.get("pre_tp_hits", 0), state_store.get("pre_sl_hits", 0)
-
-        msg = build_message(res)
-        msg += "\n\n" + RULE + "\n" + f"<code>PRE #{pre_number}</code>  " + \
-               _record_line(pre_tp, pre_sl, "PRE").split("</code>", 1)[-1].strip()
-        send_telegram(msg)
-
-        if res.get("entry") is not None:
-            state_store.setdefault("pending_trades", []).append({
-                "signal_number": pre_number, "dir": "BUY" if current_state == "PRE_BUY" else "SELL",
-                "kind": "pre",
-                "entry": res["entry"], "sl": res["sl"], "tp": res["tp"],
-                "opened_at_ms": int(now_utc.timestamp() * 1000),
-            })
+        # 5/6 (strong) and 4/6 pre-signals are scored separately - a setup one condition
+        # away may behave very differently from one two away.
+        kind = "strong_pre" if res.get("strong_pre") else "pre"
+        direction = "BUY" if current_state == "PRE_BUY" else "SELL"
+        register_signal(state_store, res, kind, direction, now_utc, pre_style=True)
         state_store["last_state"] = current_state
         save_state(state_store)
 
