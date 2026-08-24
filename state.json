@@ -11,7 +11,93 @@
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4604.399902,
+  "last_seen_price": 4648.399902,
   "last_heartbeat_date": "2026-08-23",
-  "last_warn_ms": 1787514320452.5261
+  "last_warn_ms": 1787514320452.5261,
+  "counters": {
+    "confirmed": 0,
+    "risky": 0,
+    "strong_pre": 0,
+    "pre": 0
+  },
+  "records": {
+    "alltime": {
+      "buy": {
+        "confirmed": [
+          0,
+          0
+        ],
+        "risky": [
+          0,
+          0
+        ],
+        "strong_pre": [
+          0,
+          0
+        ],
+        "pre": [
+          0,
+          0
+        ]
+      },
+      "sell": {
+        "confirmed": [
+          0,
+          0
+        ],
+        "risky": [
+          0,
+          0
+        ],
+        "strong_pre": [
+          0,
+          0
+        ],
+        "pre": [
+          0,
+          0
+        ]
+      }
+    },
+    "today": {
+      "buy": {
+        "confirmed": [
+          0,
+          0
+        ],
+        "risky": [
+          0,
+          0
+        ],
+        "strong_pre": [
+          0,
+          0
+        ],
+        "pre": [
+          0,
+          0
+        ]
+      },
+      "sell": {
+        "confirmed": [
+          0,
+          0
+        ],
+        "risky": [
+          0,
+          0
+        ],
+        "strong_pre": [
+          0,
+          0
+        ],
+        "pre": [
+          0,
+          0
+        ]
+      },
+      "date": "2026-08-24",
+      "fired": 0
+    }
+  }
 }
