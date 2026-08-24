@@ -2,26 +2,39 @@ name: XAU Signal Scan
 
 on:
   schedule:
-    # Trigger ONCE per hour. GitHub heavily throttles */5 schedules on free tier and
-    # silently skips most runs, so instead each job loops internally every 5 minutes
-    # for ~55 minutes. One reliable trigger beats twelve unreliable ones.
+    # TWICE per hour at OFF-PEAK minutes (:07 and :37).
+    #
+    # Two lessons learned the hard way:
+    #  1. A */5 schedule gets throttled - most runs are silently skipped.
+    #  2. Minute :00 is the most congested minute on GitHub's infrastructure. GitHub's
+    #     own docs warn that top-of-hour schedules are commonly delayed 5-30 minutes and
+    #     "some queued jobs may be dropped" entirely. Scheduling at :00 cost us a full
+    #     morning session with zero runs.
+    #
+    # So: fire at :07 and :37, and have each job loop internally every 5 minutes for
+    # ~27 minutes. Two triggers per hour means a single dropped trigger costs ~30 minutes
+    # of coverage instead of a full hour.
     # Covers 7am-4pm PKT (02:00-11:00 UTC) and 8pm-11pm PKT (15:00-18:00 UTC).
-    - cron: "0 2-11 * * *"
-    - cron: "0 15-18 * * *"
+    - cron: "7,37 2-11 * * *"
+    - cron: "7,37 15-18 * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 permissions:
   contents: write
 
 # Prevent overlapping hourly jobs from fighting over the same state.json
+# Scheduled runs share one lock so two loops never write state.json at once.
+# Manual runs get their OWN group, so a test fires immediately instead of queueing
+# behind a 27-minute loop. This is safe because manual runs never register signals or
+# touch any tally - they only read data and send one status message.
 concurrency:
-  group: xau-signal-scan
+  group: xau-signal-scan-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Continuous scan loop (aligned to 5m candle closes, ~55 min)
+      - name: Continuous scan loop (aligned to 5m candle closes, ~27 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -43,10 +56,17 @@ jobs:
           # tick. A fixed "sleep 300" would drift relative to those boundaries and could
           # land mid-candle, delaying detection by up to a full interval.
           BUFFER=20
-          END=$(( $(date +%s) + 55*60 ))
+          # A manual run is a one-shot test: scan once, send the status message, exit.
+          # Only scheduled runs need the continuous 27-minute loop.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            LOOP_SECONDS=0
+          else
+            LOOP_SECONDS=$(( 27*60 ))
+          fi
+          END=$(( $(date +%s) + LOOP_SECONDS ))
           ITER=0
 
-          while [ "$(date +%s)" -lt "$END" ]; do
+          while : ; do
             ITER=$((ITER+1))
             echo "--- scan iteration $ITER at $(date -u '+%H:%M:%S UTC') ---"
             SCAN_ITERATION=$ITER python xau_bot.py || echo "scan iteration failed, continuing"
@@ -59,6 +79,12 @@ jobs:
               git commit -m "Update signal state [skip ci]" || true
               git pull --rebase --autostash origin main || true
               git push || echo "push failed, will retry next iteration"
+            fi
+
+            # Manual run: one scan is all we need.
+            if [ "$LOOP_SECONDS" -eq 0 ]; then
+              echo "manual run complete after 1 scan"
+              break
             fi
 
             # Sleep until just after the NEXT 5-minute boundary.
