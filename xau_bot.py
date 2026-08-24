@@ -1247,6 +1247,20 @@ def build_heartbeat_message(res, state_store, now_utc):
         f"<i>Fired today: {today.get('fired', 0)}  ·  "
         f"Open: {len(state_store.get('pending_trades', []))}</i>",
     ]
+    # List any trades still awaiting an outcome, so nothing sits silently unresolved.
+    pending = state_store.get("pending_trades", [])
+    if pending:
+        now_ms = now_utc.timestamp() * 1000
+        lines.append("")
+        lines.append("<b>AWAITING OUTCOME</b>")
+        for t in pending[:6]:
+            age_h = (now_ms - t.get("opened_at_ms", now_ms)) / 3600000
+            kind = KIND_LABELS.get(t.get("kind"), "Signal")
+            lines.append(
+                f"<code>{t.get('dir', ''):<5}{kind:<11}#{t.get('signal_number', 0):<4}"
+                f"{age_h:>4.0f}h</code>")
+        if len(pending) > 6:
+            lines.append(f"<i>…and {len(pending) - 6} more</i>")
     return "\n".join(lines)
 
 
@@ -1271,11 +1285,23 @@ def process_pending_trades(candles5, state_store, now_utc=None):
         outcome = resolve_trade(trade, candles5)
         if outcome is None:
             age = now_ms - trade.get("opened_at_ms", now_ms)
-            if age > expiry_ms:
-                # Neither TP nor SL was reached inside the data window - drop it rather
-                # than tracking it forever. Not counted as a win or a loss.
-                print(f"Expiring unresolved trade #{trade.get('signal_number')} "
-                      f"({trade.get('kind')}) after {age/3600000:.0f}h")
+            # A trade that opened before the oldest candle we can see can never be
+            # resolved - the feed's history no longer covers it. Retire it immediately
+            # rather than leaving it pending until the expiry clock runs out.
+            oldest_ms = candles5[0]["t"] if candles5 else None
+            unseeable = oldest_ms is not None and trade.get("opened_at_ms", 0) < oldest_ms
+            if age > expiry_ms or unseeable:
+                reason = ("price history no longer covers when it opened"
+                          if unseeable else f"still unresolved after {age / 3600000:.0f}h")
+                kind_label = {"confirmed": "Signal", "risky": "Risky signal",
+                              "strong_pre": "Strong pre-signal",
+                              "pre": "Pre-signal"}.get(trade.get("kind"), "Signal")
+                print(f"Expiring {kind_label} #{trade.get('signal_number')}: {reason}")
+                send_telegram(
+                    f"⏱️ <b>{kind_label} #{trade.get('signal_number')} closed unresolved</b>\n"
+                    + RULE + "\n"
+                    f"<code>{trade.get('dir', ''):<6}{trade.get('entry', 0):>9.2f}</code>\n"
+                    f"<i>{reason} — not counted as a win or a loss.</i>")
                 continue
             still_pending.append(trade)
             continue
@@ -1409,6 +1435,13 @@ def main():
     # message can show both without ever letting the live tick affect the logic.
     res["live_spot"] = (spot or {}).get("spot_usd_oz")
 
+    # Resolve any open trades FIRST - before the session and warm-up gates.
+    # A trade can hit its TP or SL at any hour, including outside your trading windows.
+    # Previously this ran after those gates, so an overnight move went unrecorded until
+    # the next session opened - and a trade could even expire before being checked.
+    if not is_manual_run and candles5:
+        process_pending_trades(candles5, state_store, now_utc)
+
     # Daily check-in runs regardless of session, so silence is never ambiguous.
     # Skipped on manual runs - a test shouldn't consume or duplicate the day's heartbeat.
     if not is_manual_run:
@@ -1435,11 +1468,8 @@ def main():
                 "<i>If the tick count is low, the price feed is returning less history "
                 "than usual.</i>")
         print("Still warming up, not enough candle history yet.")
+        save_state(state_store)   # persist any trade resolutions done above
         return
-
-    # Check any open confirmed signals for TP/SL resolution first, regardless of current state.
-    if not is_manual_run:
-        process_pending_trades(candles5, state_store, now_utc)
 
     last_state = state_store.get("last_state", "NONE")
     current_state = res.get("state")
