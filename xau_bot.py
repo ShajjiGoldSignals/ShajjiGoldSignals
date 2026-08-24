@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -57,18 +58,33 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ============================= DATA FETCH =============================
+def _get_json(url, attempts=3, timeout=30):
+    """Fetch with retries. The feed intermittently times out, and a single failed request
+    would otherwise cost a whole scan cycle. Backs off between attempts."""
+    last = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            print(f"  fetch attempt {i + 1}/{attempts} failed: {e}")
+            if i < attempts - 1:
+                time.sleep(3 * (i + 1))
+    raise last
+
+
 def fetch_intraday():
     url = f"https://xaus.com/api/v1/intraday?symbol={SYMBOL}&hours={INTRADAY_HOURS}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json().get("points", [])
+    data = _get_json(url)
+    points = data.get("points", [])
+    print(f"  feed returned {len(points)} ticks")
+    return points
 
 
 def fetch_spot():
-    url = "https://xaus.com/api/v1/spot?compact=1"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    return _get_json("https://xaus.com/api/v1/spot?compact=1")
 
 
 # ============================= CANDLES =============================
@@ -591,8 +607,15 @@ def in_session_window(now_utc):
 
 # ============================= SIGNAL ENGINE =============================
 def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=False):
-    if len(candles5) < 60 or len(candles15) < 40 or len(candles30) < 30 or len(candles60) < 20:
-        return {"state": "WARMING_UP"}
+    # Report WHICH timeframe is short and by how much - a bare "warming up" tells us
+    # nothing when the real cause is a degraded feed returning too few ticks.
+    need = {"5m": (len(candles5), 60), "15m": (len(candles15), 40),
+            "30m": (len(candles30), 30), "1H": (len(candles60), 20)}
+    short = [f"{tf} {have}/{req}" for tf, (have, req) in need.items() if have < req]
+    if short:
+        return {"state": "WARMING_UP",
+                "warmup_detail": ", ".join(f"{tf} {have}/{req}" for tf, (have, req) in need.items()),
+                "warmup_short": ", ".join(short)}
 
     price = candles5[-1]["c"]
     closes5 = [c["c"] for c in candles5]
@@ -1390,8 +1413,15 @@ def main():
 
     if res.get("state") == "WARMING_UP":
         if is_manual_run:
-            send_telegram("⏳ Demo run: still building candle history from live ticks — "
-                           "try again in a few minutes once more data has accumulated.")
+            detail = res.get("warmup_detail", "n/a")
+            short = res.get("warmup_short", "n/a")
+            send_telegram(
+                "⏳ <b>Not enough candles to evaluate</b>\n" + RULE + "\n"
+                f"<code>Ticks from feed : {len(points)}</code>\n"
+                f"<code>Candles built   : {detail}</code>\n"
+                f"<b>Short of minimum:</b> {short}\n\n"
+                "<i>If the tick count is low, the price feed is returning less history "
+                "than usual.</i>")
         print("Still warming up, not enough candle history yet.")
         return
 
