@@ -58,6 +58,72 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 # ============================= DATA FETCH =============================
+# ============================= TWELVE DATA (primary source) =============================
+TD_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+TD_SYMBOL = "XAU/USD"          # spot gold - same instrument MT5 shows, not futures
+TD_OUTPUTSIZE = 1500           # 1500 x 5m candles is about 5 days of history
+
+
+def fetch_twelvedata_5m():
+    """Fetch real 5-minute OHLC candles for spot gold.
+
+    Only the 5m series is requested; 15m/30m/1H are aggregated from it locally. That keeps
+    us to ONE api credit per scan (~144/day against an 800/day free limit) and guarantees
+    every timeframe is derived from identical underlying data.
+    """
+    if not TD_API_KEY:
+        raise RuntimeError("TWELVEDATA_API_KEY not set")
+    url = ("https://api.twelvedata.com/time_series"
+           f"?symbol={TD_SYMBOL}&interval=5min&outputsize={TD_OUTPUTSIZE}"
+           f"&timezone=UTC&order=ASC&apikey={TD_API_KEY}")
+    data = _get_json(url)
+
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise RuntimeError(f"TwelveData error {data.get('code')}: {data.get('message')}")
+
+    values = (data or {}).get("values") or []
+    candles = []
+    for v in values:
+        try:
+            dt = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            candles.append({
+                "t": int(dt.timestamp() * 1000),
+                "o": float(v["open"]), "h": float(v["high"]),
+                "l": float(v["low"]), "c": float(v["close"]),
+            })
+        except (KeyError, ValueError) as e:
+            print(f"  skipping malformed candle: {e}")
+    candles.sort(key=lambda c: c["t"])
+    print(f"  TwelveData returned {len(candles)} 5m candles")
+    return candles
+
+
+def aggregate_candles(c5, interval_min):
+    """Roll 5-minute candles up into a higher timeframe.
+
+    5 divides evenly into 15/30/60, and buckets are aligned to the clock, so the result
+    matches what a chart would draw for that timeframe.
+    """
+    if interval_min == 5:
+        return list(c5)
+    bucket_ms = interval_min * 60000
+    out = []
+    cur = None
+    for c in c5:
+        bs = (c["t"] // bucket_ms) * bucket_ms
+        if cur is None or cur["t"] != bs:
+            if cur is not None:
+                out.append(cur)
+            cur = {"t": bs, "o": c["o"], "h": c["h"], "l": c["l"], "c": c["c"]}
+        else:
+            cur["h"] = max(cur["h"], c["h"])
+            cur["l"] = min(cur["l"], c["l"])
+            cur["c"] = c["c"]
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
 def _get_json(url, attempts=3, timeout=30):
     """Fetch with retries. The feed intermittently times out, and a single failed request
     would otherwise cost a whole scan cycle. Backs off between attempts."""
@@ -1392,25 +1458,54 @@ def main():
     state_store = load_state()
     roll_today_if_new_day(state_store, now_utc)
 
-    # The heartbeat should fire even outside session hours, so fetch first and gate later.
-    try:
-        points = fetch_intraday()
-        spot = fetch_spot()
-    except Exception as e:
-        print("Data fetch failed:", e)
-        # A persistent outage is worth knowing about; the cooldown stops it spamming.
-        if should_send_warning(state_store, now_utc):
-            send_telegram(f"⚠️ <b>Data feed unreachable</b>\n{RULE}\n<i>{e}</i>\n"
-                          f"Scanning will resume automatically when the feed returns.")
-            save_state(state_store)
-        sys.exit(0)  # don't fail the workflow on a transient API hiccup
+    # PRIMARY: TwelveData real OHLC candles for spot gold (days of history).
+    # FALLBACK: the original tick feed, so a TwelveData outage never leaves us blind.
+    source = None
+    raw5 = None
+    points = []
+    spot = {}
+    td_error = None
 
-    # Build candles, then drop the still-forming bar on each timeframe so every indicator,
-    # trendline and pattern is evaluated on CLOSED candles only - same as reading MT5.
-    candles5 = drop_forming_candle(build_candles(points, 5), 5, now_utc)
-    candles15 = drop_forming_candle(build_candles(points, 15), 15, now_utc)
-    candles30 = drop_forming_candle(build_candles(points, 30), 30, now_utc)
-    candles60 = drop_forming_candle(build_candles(points, 60), 60, now_utc)
+    try:
+        raw5 = fetch_twelvedata_5m()
+        if len(raw5) < 100:
+            raise RuntimeError(f"only {len(raw5)} candles returned")
+        source = "twelvedata"
+    except Exception as e:
+        td_error = e
+        print("TwelveData unavailable, falling back to tick feed:", e)
+
+    if source is None:
+        try:
+            points = fetch_intraday()
+            spot = fetch_spot()
+            raw5 = build_candles(points, 5)
+            source = "fallback"
+        except Exception as e:
+            print("Data fetch failed:", e)
+            if should_send_warning(state_store, now_utc):
+                send_telegram(
+                    f"⚠️ <b>Both data feeds unreachable</b>\n{RULE}\n"
+                    f"<i>TwelveData: {td_error}</i>\n<i>Fallback: {e}</i>\n"
+                    f"Scanning will resume automatically when a feed returns.")
+                save_state(state_store)
+            sys.exit(0)  # don't fail the workflow on a transient API hiccup
+
+    print(f"  data source: {source}")
+
+    # Live-ish price = newest candle close, taken BEFORE the forming bar is dropped.
+    if raw5 and not spot:
+        spot = {"spot_usd_oz": raw5[-1]["c"]}
+
+    # Higher timeframes are aggregated from the SAME 5m series, so every timeframe is
+    # derived from identical data. Then drop the still-forming bar on each so every
+    # indicator, trendline and pattern is evaluated on CLOSED candles only - like MT5.
+    candles5 = drop_forming_candle(raw5, 5, now_utc)
+    candles15 = drop_forming_candle(aggregate_candles(raw5, 15), 15, now_utc)
+    candles30 = drop_forming_candle(aggregate_candles(raw5, 30), 30, now_utc)
+    candles60 = drop_forming_candle(aggregate_candles(raw5, 60), 60, now_utc)
+    if not points:
+        points = raw5  # keep tick-count diagnostics meaningful
 
     # --- Data sanity: fatal only when there is genuinely nothing to evaluate ---
     fatal, data_warnings = check_data_sanity(points, spot, candles5, state_store, now_utc)
