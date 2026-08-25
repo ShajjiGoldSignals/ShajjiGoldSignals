@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import re
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -54,6 +55,7 @@ DATA_WARN_COOLDOWN_MINUTES = 60   # don't repeat the same warning more often tha
 # --- Daily heartbeat ---
 HEARTBEAT_HOUR_PKT = 23           # send the daily summary at this PKT hour
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
@@ -955,17 +957,86 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
 
 
 # ============================= TELEGRAM =============================
-def send_telegram(text):
+def _send_telegram_only(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured, skipping send. Message would have been:\n", text)
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                                     "parse_mode": "HTML"}, timeout=15)
         if not r.ok:
             print("Telegram send failed:", r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
         print("Telegram send error:", e)
+        return False
+
+
+def html_to_discord(text):
+    """Convert our Telegram HTML into Discord markdown, preserving table alignment.
+
+    The reports rely on monospaced columns lining up. Discord only guarantees monospace
+    inside a fenced code block, and markdown like **bold** is NOT rendered in there - so
+    any line containing <code> is treated as table content: formatting tags are stripped
+    and the run of such lines is wrapped in a single ``` block. Everything else becomes
+    normal Discord markdown.
+    """
+    lines = text.split("\n")
+    out = []
+    block = []
+
+    def flush():
+        if block:
+            out.append("```\n" + "\n".join(block) + "\n```")
+            block.clear()
+
+    for line in lines:
+        is_table = "<code>" in line
+        clean = re.sub(r"</?(b|i|code)>", "", line)
+        clean = (clean.replace("&lt;", "<").replace("&gt;", ">")
+                      .replace("&amp;", "&").replace("&quot;", '"'))
+        if is_table:
+            block.append(clean)
+            continue
+        flush()
+        md = line
+        md = re.sub(r"<b>(.*?)</b>", r"**\1**", md, flags=re.S)
+        md = re.sub(r"<i>(.*?)</i>", r"*\1*", md, flags=re.S)
+        md = re.sub(r"</?(b|i|code)>", "", md)
+        md = (md.replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&amp;", "&").replace("&quot;", '"'))
+        out.append(md)
+    flush()
+    return "\n".join(out)
+
+
+def _send_discord_only(text):
+    if not DISCORD_WEBHOOK_URL:
+        return False
+    content = html_to_discord(text)
+    if len(content) > 1900:          # Discord hard-caps a message at 2000 characters
+        content = content[:1890] + "\n…(truncated)"
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=15)
+        if r.status_code not in (200, 204):
+            print("Discord send failed:", r.status_code, r.text[:200])
+            return False
+        return True
+    except Exception as e:
+        print("Discord send error:", e)
+        return False
+
+
+def send_telegram(text):
+    """Send to every configured channel. Named for history; it fans out to Discord too,
+    so losing one platform never means losing the alert."""
+    sent_tg = _send_telegram_only(text)
+    sent_dc = _send_discord_only(text)
+    if not (sent_tg or sent_dc):
+        print("No notification channel configured/reachable. Message was:\n", text)
+    else:
+        print(f"  notified -> telegram:{sent_tg} discord:{sent_dc}")
 
 
 
