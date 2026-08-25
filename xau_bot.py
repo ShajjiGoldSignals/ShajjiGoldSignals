@@ -973,48 +973,65 @@ def _send_telegram_only(text):
         return False
 
 
-def html_to_discord(text):
-    """Convert our Telegram HTML into Discord markdown, preserving table alignment.
+def html_to_discord(text, single_block=False):
+    """Convert Telegram HTML into Discord markdown WITHOUT dropping any content.
 
-    The reports rely on monospaced columns lining up. Discord only guarantees monospace
-    inside a fenced code block, and markdown like **bold** is NOT rendered in there - so
-    any line containing <code> is treated as table content: formatting tags are stripped
-    and the run of such lines is wrapped in a single ``` block. Everything else becomes
-    normal Discord markdown.
+    Discord only guarantees monospace inside a fenced block, and markdown is not rendered
+    in there. Two layouts:
+
+      single_block=True  - the whole message becomes ONE code block. Used for the daily
+                           report, where column alignment matters more than bold headers.
+      single_block=False - header lines keep Discord bold/italic, and every body line is
+                           merged into ONE continuous code block rather than several, so
+                           the message reads as a single card instead of scattered boxes.
+
+    Either way every line survives; only the styling differs.
     """
-    lines = text.split("\n")
-    out = []
-    block = []
+    def strip_tags(line):
+        out = re.sub(r"</?(b|i|code)>", "", line)
+        return (out.replace("&lt;", "<").replace("&gt;", ">")
+                   .replace("&amp;", "&").replace("&quot;", '"'))
 
-    def flush():
-        if block:
-            out.append("```\n" + "\n".join(block) + "\n```")
-            block.clear()
-
-    for line in lines:
-        is_table = "<code>" in line
-        clean = re.sub(r"</?(b|i|code)>", "", line)
-        clean = (clean.replace("&lt;", "<").replace("&gt;", ">")
-                      .replace("&amp;", "&").replace("&quot;", '"'))
-        if is_table:
-            block.append(clean)
-            continue
-        flush()
-        md = line
-        md = re.sub(r"<b>(.*?)</b>", r"**\1**", md, flags=re.S)
+    def to_md(line):
+        md = re.sub(r"<b>(.*?)</b>", r"**\1**", line, flags=re.S)
         md = re.sub(r"<i>(.*?)</i>", r"*\1*", md, flags=re.S)
         md = re.sub(r"</?(b|i|code)>", "", md)
-        md = (md.replace("&lt;", "<").replace("&gt;", ">")
-                .replace("&amp;", "&").replace("&quot;", '"'))
-        out.append(md)
-    flush()
+        return (md.replace("&lt;", "<").replace("&gt;", ">")
+                  .replace("&amp;", "&").replace("&quot;", '"'))
+
+    lines = text.split("\n")
+
+    if single_block:
+        body = "\n".join(strip_tags(l) for l in lines)
+        return "```\n" + body + "\n```"
+
+    # A "header" is a short standalone line with no table content - the title, the
+    # section labels. Everything from the first body line onward goes in one block.
+    head = []
+    body = []
+    for i, line in enumerate(lines):
+        looks_header = (i < 2 and "<code>" not in line)
+        if looks_header and not body:
+            head.append(to_md(line))
+        else:
+            body.append(strip_tags(line))
+
+    # Trim blank lines at the edges of the block so it renders tight.
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+
+    out = [l for l in head if l.strip()]
+    if body:
+        out.append("```\n" + "\n".join(body) + "\n```")
     return "\n".join(out)
 
 
-def _send_discord_only(text):
+def _send_discord_only(text, single_block=False):
     if not DISCORD_WEBHOOK_URL:
         return False
-    content = html_to_discord(text)
+    content = html_to_discord(text, single_block=single_block)
     if len(content) > 1900:          # Discord hard-caps a message at 2000 characters
         content = content[:1890] + "\n…(truncated)"
     try:
@@ -1028,11 +1045,11 @@ def _send_discord_only(text):
         return False
 
 
-def send_telegram(text):
+def send_telegram(text, discord_single_block=False):
     """Send to every configured channel. Named for history; it fans out to Discord too,
     so losing one platform never means losing the alert."""
     sent_tg = _send_telegram_only(text)
-    sent_dc = _send_discord_only(text)
+    sent_dc = _send_discord_only(text, single_block=discord_single_block)
     if not (sent_tg or sent_dc):
         print("No notification channel configured/reachable. Message was:\n", text)
     else:
@@ -1054,9 +1071,9 @@ def _price_lines(res):
     live = res.get("live_spot")
     if price is None:
         return ["<b>XAU/USD</b>   <i>n/a</i>"]
-    out = [f"<b>XAU/USD</b>   <code>${price:.2f}</code>  <i>(last closed candle)</i>"]
+    out = [f"<code>CLOSED   {price:>9.2f}</code>"]
     if live is not None and abs(live - price) >= 0.01:
-        out.append(f"<code>LIVE     ${live:.2f}</code>")
+        out.append(f"<code>LIVE     {live:>9.2f}</code>")
     return out
 
 
@@ -1409,7 +1426,8 @@ def maybe_send_heartbeat(res, state_store, now_utc):
         return
     if pkt.hour < HEARTBEAT_HOUR_PKT:
         return
-    send_telegram(build_heartbeat_message(res, state_store, now_utc))
+    send_telegram(build_heartbeat_message(res, state_store, now_utc),
+                  discord_single_block=True)
     state_store["last_heartbeat_date"] = today
 
 
