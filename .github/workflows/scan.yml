@@ -2,21 +2,24 @@ name: XAU Signal Scan
 
 on:
   schedule:
-    # TWICE per hour at OFF-PEAK minutes (:07 and :37).
+    # Every 15 minutes, 24/7, at OFF-PEAK minutes.
     #
-    # Two lessons learned the hard way:
-    #  1. A */5 schedule gets throttled - most runs are silently skipped.
-    #  2. Minute :00 is the most congested minute on GitHub's infrastructure. GitHub's
-    #     own docs warn that top-of-hour schedules are commonly delayed 5-30 minutes and
-    #     "some queued jobs may be dropped" entirely. Scheduling at :00 cost us a full
-    #     morning session with zero runs.
+    # Why 24/7 and not just session hours: trades hit TP or SL at any time. Resolution
+    # runs before the session gate, so a round-the-clock schedule means a trade that
+    # closes overnight is recorded immediately instead of waiting for the next session.
+    # Evaluation itself is still gated to 7-16 and 20-23 PKT inside the Python.
     #
-    # So: fire at :07 and :37, and have each job loop internally every 5 minutes for
-    # ~27 minutes. Two triggers per hour means a single dropped trigger costs ~30 minutes
-    # of coverage instead of a full hour.
-    # Covers 7am-4pm PKT (02:00-11:00 UTC) and 8pm-11pm PKT (15:00-18:00 UTC).
-    - cron: "7,37 2-11 * * *"
-    - cron: "7,37 15-18 * * *"
+    # Why four triggers an hour: GitHub treats cron as best effort and drops triggers
+    # under load - we lost a full morning and a full evening session to this. 96 chances
+    # a day instead of 24 means losing several changes nothing. Minute :00 is avoided
+    # entirely; it is the most congested minute on GitHub's infrastructure.
+    #
+    # Each job now runs for ~5h50m (just under GitHub's 6-hour job limit) rather than 27
+    # minutes. Long jobs mean coverage does NOT depend on catching a trigger every half
+    # hour - one trigger that lands keeps scanning for most of the day. The frequent
+    # triggers still queue behind it (see concurrency) and take over the instant it ends,
+    # so handover is seamless and a dropped trigger costs nothing.
+    - cron: "2,17,32,47 * * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 permissions:
@@ -25,7 +28,7 @@ permissions:
 # Prevent overlapping hourly jobs from fighting over the same state.json
 # Scheduled runs share one lock so two loops never write state.json at once.
 # Manual runs get their OWN group, so a test fires immediately instead of queueing
-# behind a 27-minute loop. This is safe because manual runs never register signals or
+# behind a long-running loop. This is safe because manual runs never register signals or
 # touch any tally - they only read data and send one status message.
 concurrency:
   group: xau-signal-scan-${{ github.event_name }}
@@ -34,7 +37,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Continuous scan loop (aligned to 5m candle closes, ~27 min)
+      - name: Continuous scan loop (aligned to 5m candle closes, runs ~5h50m)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -63,7 +66,7 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             LOOP_SECONDS=0
           else
-            LOOP_SECONDS=$(( 27*60 ))
+            LOOP_SECONDS=$(( 350*60 ))   # ~5h50m, just under the 6h job limit
           fi
           END=$(( $(date +%s) + LOOP_SECONDS ))
           ITER=0
