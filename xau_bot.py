@@ -54,6 +54,8 @@ DATA_JUMP_WARN_PCT = 3.0          # price moved this % since last scan
 DATA_WARN_COOLDOWN_MINUTES = 60   # don't repeat the same warning more often than this
 # --- Daily heartbeat ---
 HEARTBEAT_HOUR_PKT = 23           # send the daily summary at this PKT hour
+# --- Scan-gap watchdog ---
+SCAN_GAP_ALERT_MINUTES = 20       # a gap longer than this during a session is reported
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -98,6 +100,30 @@ def fetch_twelvedata_5m():
     candles.sort(key=lambda c: c["t"])
     print(f"  TwelveData returned {len(candles)} 5m candles")
     return candles
+
+
+def fetch_twelvedata_price():
+    """Genuine real-time quote from the /price endpoint.
+
+    The newest candle's close is NOT a live price - the feed doesn't return the still
+    forming bar, so deriving 'live' from candles just repeats the last closed price.
+    This is a separate call (1 extra credit, ~288/day against an 800/day limit) that
+    returns the actual current market price, so the message can show what you would
+    really be entering at versus what the signal was calculated on.
+    """
+    if not TD_API_KEY:
+        return None
+    url = f"https://api.twelvedata.com/price?symbol={TD_SYMBOL}&apikey={TD_API_KEY}"
+    try:
+        data = _get_json(url, attempts=2, timeout=15)
+        if isinstance(data, dict) and data.get("status") == "error":
+            print(f"  live price unavailable: {data.get('message')}")
+            return None
+        val = (data or {}).get("price")
+        return float(val) if val is not None else None
+    except Exception as e:
+        print(f"  live price fetch failed: {e}")
+        return None
 
 
 def aggregate_candles(c5, interval_min):
@@ -1072,8 +1098,14 @@ def _price_lines(res):
     if price is None:
         return ["<b>XAU/USD</b>   <i>n/a</i>"]
     out = [f"<code>CLOSED   {price:>9.2f}</code>"]
-    if live is not None and abs(live - price) >= 0.01:
-        out.append(f"<code>LIVE     {live:>9.2f}</code>")
+    if live is not None:
+        drift = live - price
+        if abs(drift) >= 0.01:
+            # Show how far the market has already moved from the price the signal was
+            # calculated on - that gap is your real slippage before you even enter.
+            out.append(f"<code>LIVE     {live:>9.2f}  {drift:+.2f}</code>")
+        else:
+            out.append(f"<code>LIVE     {live:>9.2f}</code>")
     return out
 
 
@@ -1582,7 +1614,13 @@ def main():
 
     print(f"  data source: {source}")
 
-    # Live-ish price = newest candle close, taken BEFORE the forming bar is dropped.
+    # True real-time price. Falls back to the newest candle close only if the quote
+    # endpoint is unavailable, so a failure here never blocks a scan.
+    if source == "twelvedata":
+        live = fetch_twelvedata_price()
+        if live is not None:
+            spot = {"spot_usd_oz": live, "is_realtime": True}
+            print(f"  live quote: {live:.2f}")
     if raw5 and not spot:
         spot = {"spot_usd_oz": raw5[-1]["c"]}
 
@@ -1618,6 +1656,24 @@ def main():
     # The decision is made on the last CLOSED candle; carry the live spot through too so the
     # message can show both without ever letting the live tick affect the logic.
     res["live_spot"] = (spot or {}).get("spot_usd_oz")
+
+    # --- Watchdog: detect and report any gap in scanning ---------------------------
+    # GitHub's scheduler is best-effort and does drop triggers. This can't prevent a
+    # gap, but it makes one impossible to miss: if the previous scan was longer ago
+    # than expected while a session was running, say so explicitly.
+    now_ms = int(now_utc.timestamp() * 1000)
+    prev_scan = state_store.get("last_scan_ms")
+    if prev_scan:
+        gap_min = (now_ms - prev_scan) / 60000.0
+        if gap_min > SCAN_GAP_ALERT_MINUTES and in_session_window(now_utc):
+            if should_send_warning(state_store, now_utc):
+                send_telegram(
+                    f"⏸️ <b>Scanning gap detected</b>\n{RULE}\n"
+                    f"<code>Last scan  {gap_min:.0f} min ago</code>\n"
+                    f"<code>Expected   every 5 min</code>\n"
+                    f"<i>The scheduler missed some runs. Scanning has resumed — but "
+                    f"setups during that window were not checked.</i>")
+    state_store["last_scan_ms"] = now_ms
 
     # Resolve any open trades FIRST - before the session and warm-up gates.
     # A trade can hit its TP or SL at any hour, including outside your trading windows.
