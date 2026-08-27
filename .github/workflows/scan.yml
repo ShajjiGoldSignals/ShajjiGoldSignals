@@ -2,23 +2,21 @@ name: XAU Signal Scan
 
 on:
   schedule:
-    # Every 15 minutes, 24/7, at OFF-PEAK minutes.
+    # Trigger every 15 minutes, 24/7. Each job runs for ~13 minutes - deliberately
+    # SHORTER than the gap between triggers.
     #
-    # Why 24/7 and not just session hours: trades hit TP or SL at any time. Resolution
-    # runs before the session gate, so a round-the-clock schedule means a trade that
-    # closes overnight is recorded immediately instead of waiting for the next session.
-    # Evaluation itself is still gated to 7-16 and 20-23 PKT inside the Python.
+    # This matters: a previous version used ~6-hour jobs with 15-minute triggers, which
+    # meant ~23 queued requests piled up behind every running job. GitHub then cancelled
+    # the RUNNING job in favour of the queue ("higher priority waiting request exists"),
+    # so long jobs kept dying part-way through. Job duration must stay under the trigger
+    # interval so a queue never forms.
     #
-    # Why four triggers an hour: GitHub treats cron as best effort and drops triggers
-    # under load - we lost a full morning and a full evening session to this. 96 chances
-    # a day instead of 24 means losing several changes nothing. Minute :00 is avoided
-    # entirely; it is the most congested minute on GitHub's infrastructure.
+    # 96 triggers a day also means a dropped trigger costs at most ~15 minutes, instead
+    # of the multi-hour gaps we saw when relying on only 2 triggers an hour.
     #
-    # Each job now runs for ~5h50m (just under GitHub's 6-hour job limit) rather than 27
-    # minutes. Long jobs mean coverage does NOT depend on catching a trigger every half
-    # hour - one trigger that lands keeps scanning for most of the day. The frequent
-    # triggers still queue behind it (see concurrency) and take over the instant it ends,
-    # so handover is seamless and a dropped trigger costs nothing.
+    # 24/7 rather than session hours: trade resolution runs before the session gate, so
+    # a trade that hits TP overnight is recorded immediately. Evaluation itself is still
+    # gated to 7-16 and 20-23 PKT inside the Python.
     - cron: "2,17,32,47 * * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
@@ -37,7 +35,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +46,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Continuous scan loop (aligned to 5m candle closes, runs ~5h50m)
+      - name: Continuous scan loop (aligned to 5m candle closes, ~13 min)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -66,7 +64,7 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             LOOP_SECONDS=0
           else
-            LOOP_SECONDS=$(( 350*60 ))   # ~5h50m, just under the 6h job limit
+            LOOP_SECONDS=$(( 13*60 ))   # MUST stay under the 15-min trigger interval
           fi
           END=$(( $(date +%s) + LOOP_SECONDS ))
           ITER=0
