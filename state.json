@@ -6,15 +6,6 @@
   "sl_hits": 0,
   "pending_trades": [
     {
-      "signal_number": 15,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4458.73075,
-      "sl": 4459.235249505265,
-      "tp": 4458.226250494735,
-      "opened_at_ms": 1787986528371
-    },
-    {
       "signal_number": 16,
       "dir": "SELL",
       "kind": "pre",
@@ -160,9 +151,9 @@
           0
         ]
       },
-      "date": "2026-08-30",
-      "fired": 4
+      "date": "2026-08-31",
+      "fired": 0
     }
   },
-  "last_scan_ms": 1788116117520
+  "last_scan_ms": 1788116420974
 }
