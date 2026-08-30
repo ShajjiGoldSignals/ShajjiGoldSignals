@@ -4,60 +4,14 @@
   "signal_counter": 0,
   "tp_hits": 0,
   "sl_hits": 0,
-  "pending_trades": [
-    {
-      "signal_number": 17,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4458.75234,
-      "sl": 4459.230862911509,
-      "tp": 4458.273817088491,
-      "opened_at_ms": 1788016239046
-    },
-    {
-      "signal_number": 18,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4458.75445,
-      "sl": 4459.236467857267,
-      "tp": 4458.272432142734,
-      "opened_at_ms": 1788057628858
-    },
-    {
-      "signal_number": 19,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4458.76099,
-      "sl": 4459.221086416506,
-      "tp": 4458.300893583493,
-      "opened_at_ms": 1788061230569
-    },
-    {
-      "signal_number": 20,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4458.75374,
-      "sl": 4459.2281240910925,
-      "tp": 4458.279355908908,
-      "opened_at_ms": 1788072938343
-    },
-    {
-      "signal_number": 21,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4458.75611,
-      "sl": 4459.232640840446,
-      "tp": 4458.2795791595545,
-      "opened_at_ms": 1788080129871
-    }
-  ],
+  "pending_trades": [],
   "risky_counter": 0,
   "risky_tp_hits": 0,
   "risky_sl_hits": 0,
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4456.399902,
+  "last_seen_price": 4442.700195,
   "last_heartbeat_date": "2026-08-30",
   "last_warn_ms": 1788127221045.472,
   "counters": {
@@ -100,7 +54,7 @@
           0
         ],
         "pre": [
-          6,
+          11,
           2
         ]
       }
@@ -138,7 +92,7 @@
           0
         ],
         "pre": [
-          0,
+          5,
           0
         ]
       },
@@ -146,5 +100,5 @@
       "fired": 0
     }
   },
-  "last_scan_ms": 1788126929374
+  "last_scan_ms": 1788127520292
 }
