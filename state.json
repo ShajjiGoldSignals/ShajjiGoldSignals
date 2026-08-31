@@ -1,5 +1,5 @@
 {
-  "last_state": "PRE_BUY",
+  "last_state": "NONE",
   "last_signal_time": "2026-08-19T09:28:17.498235+00:00",
   "signal_counter": 0,
   "tp_hits": 0,
@@ -39,7 +39,7 @@
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4422.83738,
+  "last_seen_price": 4432.87489,
   "last_heartbeat_date": "2026-08-30",
   "last_warn_ms": 1788127221045.472,
   "counters": {
@@ -128,5 +128,5 @@
       "fired": 7
     }
   },
-  "last_scan_ms": 1788153620728
+  "last_scan_ms": 1788153942176
 }
