@@ -23,7 +23,7 @@
   "pre_sl_hits": 0,
   "last_seen_price": 4438.200195,
   "last_heartbeat_date": "2026-08-30",
-  "last_warn_ms": 1788198933623.46,
+  "last_warn_ms": 1788202821031.9841,
   "counters": {
     "confirmed": 0,
     "risky": 0,
@@ -81,10 +81,10 @@
         ],
         "strong_pre": [
           0,
-          1
+          0
         ],
         "pre": [
-          10,
+          0,
           0
         ]
       },
@@ -98,16 +98,16 @@
           0
         ],
         "strong_pre": [
-          1,
-          1
+          0,
+          0
         ],
         "pre": [
-          7,
-          3
+          0,
+          0
         ]
       },
-      "date": "2026-08-31",
-      "fired": 19
+      "date": "2026-09-01",
+      "fired": 0
     }
   },
   "last_scan_ms": 1788198620250
