@@ -13,24 +13,6 @@
       "sl": 4443.697550158154,
       "tp": 4411.314029841847,
       "opened_at_ms": 1788147020407
-    },
-    {
-      "signal_number": 24,
-      "dir": "BUY",
-      "kind": "pre",
-      "entry": 4424.0102,
-      "sl": 4413.934994972267,
-      "tp": 4434.085405027732,
-      "opened_at_ms": 1788152420594
-    },
-    {
-      "signal_number": 25,
-      "dir": "BUY",
-      "kind": "pre",
-      "entry": 4423.90523,
-      "sl": 4413.929197343774,
-      "tp": 4433.881262656227,
-      "opened_at_ms": 1788153321001
     }
   ],
   "risky_counter": 0,
@@ -39,7 +21,7 @@
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4432.87489,
+  "last_seen_price": 4438.40953,
   "last_heartbeat_date": "2026-08-30",
   "last_warn_ms": 1788127221045.472,
   "counters": {
@@ -64,7 +46,7 @@
           2
         ],
         "pre": [
-          0,
+          2,
           2
         ]
       },
@@ -102,7 +84,7 @@
           1
         ],
         "pre": [
-          0,
+          2,
           0
         ]
       },
@@ -128,5 +110,5 @@
       "fired": 7
     }
   },
-  "last_scan_ms": 1788153942176
+  "last_scan_ms": 1788154220660
 }
