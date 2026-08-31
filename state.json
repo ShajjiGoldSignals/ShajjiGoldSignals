@@ -4,69 +4,14 @@
   "signal_counter": 0,
   "tp_hits": 0,
   "sl_hits": 0,
-  "pending_trades": [
-    {
-      "signal_number": 28,
-      "dir": "BUY",
-      "kind": "pre",
-      "entry": 4442.13212,
-      "sl": 4433.384531802368,
-      "tp": 4450.879708197633,
-      "opened_at_ms": 1788163220542
-    },
-    {
-      "signal_number": 29,
-      "dir": "BUY",
-      "kind": "pre",
-      "entry": 4439.45337,
-      "sl": 4429.88436537354,
-      "tp": 4449.02237462646,
-      "opened_at_ms": 1788164120563
-    },
-    {
-      "signal_number": 30,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4439.71131,
-      "sl": 4449.430460718029,
-      "tp": 4429.99215928197,
-      "opened_at_ms": 1788164420899
-    },
-    {
-      "signal_number": 34,
-      "dir": "BUY",
-      "kind": "pre",
-      "entry": 4439.6193,
-      "sl": 4432.017597574498,
-      "tp": 4447.221002425503,
-      "opened_at_ms": 1788168345291
-    },
-    {
-      "signal_number": 35,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4443.74171,
-      "sl": 4450.833354064334,
-      "tp": 4436.650065935666,
-      "opened_at_ms": 1788169820610
-    },
-    {
-      "signal_number": 36,
-      "dir": "BUY",
-      "kind": "pre",
-      "entry": 4443.5503,
-      "sl": 4436.939381170625,
-      "tp": 4450.161218829375,
-      "opened_at_ms": 1788170420737
-    }
-  ],
+  "pending_trades": [],
   "risky_counter": 0,
   "risky_tp_hits": 0,
   "risky_sl_hits": 0,
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4445.2015,
+  "last_seen_price": 4452.30805,
   "last_heartbeat_date": "2026-08-30",
   "last_warn_ms": 1788127221045.472,
   "counters": {
@@ -91,7 +36,7 @@
           2
         ],
         "pre": [
-          6,
+          10,
           2
         ]
       },
@@ -110,7 +55,7 @@
         ],
         "pre": [
           13,
-          3
+          5
         ]
       }
     },
@@ -129,7 +74,7 @@
           1
         ],
         "pre": [
-          6,
+          10,
           0
         ]
       },
@@ -148,12 +93,12 @@
         ],
         "pre": [
           7,
-          1
+          3
         ]
       },
       "date": "2026-08-31",
       "fired": 18
     }
   },
-  "last_scan_ms": 1788170720104
+  "last_scan_ms": 1788171046468
 }
