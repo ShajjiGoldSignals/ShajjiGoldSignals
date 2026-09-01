@@ -25,6 +25,9 @@ FAST_MA_PROXIMITY_USD = 5
 MIN_BREAK_USD = 5
 LINE_DEVIATION_USD = 3          # trendline touch tolerance (for line validity itself)
 TRENDLINE_RETEST_DEVIATION_USD = 2  # looser tolerance just for confirming a retest touch
+# After a break, price must travel this x ATR AWAY from the line before a touch back
+# counts as a retest. Without it the breaking candle satisfies its own retest.
+RETEST_MIN_DEPARTURE_ATR = 1.0
 SR_DEVIATION_USD = 5            # support/resistance touch tolerance AND retest tolerance
 SWING_LOOKBACK = 5
 RISK_REWARD = 1
@@ -562,6 +565,68 @@ def line_value_at(line, idx):
 
 
 
+def retest_after_break(candles, level_at, deviation, direction, min_break,
+                       atr_val, lookback=30):
+    """Break -> departure -> return, enforced IN THAT ORDER.
+
+    Returns (found, stage, detail). stage is the furthest point reached:
+      no_break / no_departure / no_return / ok
+
+    The old check asked only whether a recent candle straddled the line, which the BREAK
+    candle always does, and so does any candle hovering nearby. That made the retest
+    nearly free at exactly the moment breaks happen.
+    """
+    n = len(candles)
+    if n < 3 or not atr_val or atr_val <= 0:
+        return False, 'no_break', None
+    start = max(0, n - lookback)
+
+    def beyond(i):
+        lv = level_at(i)
+        if lv is None:
+            return None
+        return (candles[i]['c'] - lv) if direction == 'buy' else (lv - candles[i]['c'])
+
+    break_i = None
+    for i in range(n - 1, start - 1, -1):
+        bv = beyond(i)
+        if bv is not None and bv >= min_break:
+            break_i = i
+            break
+    if break_i is None:
+        return False, 'no_break', None
+
+    need = RETEST_MIN_DEPARTURE_ATR * atr_val
+    depart_i, best = None, 0.0
+    for i in range(break_i, n):
+        bv = beyond(i)
+        if bv is None:
+            continue
+        if bv > best:
+            best = bv
+        if bv >= need:
+            depart_i = i
+            break
+    if depart_i is None:
+        return False, 'no_departure', {'break_age': n - 1 - break_i,
+                                       'departure': best, 'needed': need}
+
+    closest, closest_lvl = None, None
+    for i in range(depart_i + 1, n):
+        lv = level_at(i)
+        if lv is None:
+            continue
+        c = candles[i]
+        if (c['l'] - deviation) <= lv <= (c['h'] + deviation):
+            return True, 'ok', {'break_age': n - 1 - break_i, 'level': lv,
+                                'departure': best}
+        gap = (lv - c['h']) if lv > c['h'] else (c['l'] - lv)
+        if closest is None or gap < closest:
+            closest, closest_lvl = gap, lv
+    return False, 'no_return', {'break_age': n - 1 - break_i, 'gap': closest,
+                                'level': closest_lvl, 'departure': best}
+
+
 def retest_touch_found(candles, level_at, deviation, lookback=10, return_detail=False):
     """Check the recent candles (excluding the very latest, which is the break/rejection
     candle itself) for a genuine touch back to the line/level — i.e. price actually came
@@ -860,18 +925,26 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
             tl_break_pass = True
             tl_break_desc = (f"Broke {tf} line <code>{line_now:.2f}</code> by "
                              f"<code>${beyond:.2f}</code> <i>(min ${MIN_BREAK_USD:.2f})</i>")
-            found, gap, lvl = retest_touch_found(
+            found, stage, det = retest_after_break(
                 cands, lambda i, ln=line: line_value_at(ln, i),
-                TRENDLINE_RETEST_DEVIATION_USD, return_detail=True)
+                TRENDLINE_RETEST_DEVIATION_USD, direction, MIN_BREAK_USD, atr5)
             if found:
                 tl_retest_pass = True
-                tl_retest_desc = (f"Retested {tf} line <code>{lvl:.2f}</code> "
-                                  f"<i>(touched within ${TRENDLINE_RETEST_DEVIATION_USD:.2f})</i>")
-            elif gap is not None:
-                tl_retest_desc = (f"Retest · closest approach <code>${gap:.2f}</code> "
-                                  f"— <b>missed by ${gap - TRENDLINE_RETEST_DEVIATION_USD:.2f}</b>")
+                tl_retest_desc = (f"Retested {tf} line <code>{det['level']:.2f}</code> "
+                                  f"<i>(broke {det['break_age']} candles ago, ran "
+                                  f"${det['departure']:.2f} away, then returned)</i>")
+            elif stage == "no_departure" and det:
+                tl_retest_desc = (f"Retest · broke {tf} but only ran "
+                                  f"<code>${det['departure']:.2f}</code> away — "
+                                  f"<b>needs ${det['needed']:.2f} first</b>")
+            elif stage == "no_return" and det and det.get("gap") is not None:
+                tl_retest_desc = (f"Retest · left the {tf} line, closest return "
+                                  f"<code>${det['gap']:.2f}</code> — <b>missed by "
+                                  f"${det['gap'] - TRENDLINE_RETEST_DEVIATION_USD:.2f}</b>")
+            elif stage == "no_return":
+                tl_retest_desc = f"Retest <i>— broke {tf} and left, hasn't returned yet</i>"
             else:
-                tl_retest_desc = f"Retest <i>— broke {tf}, price hasn't returned yet</i>"
+                tl_retest_desc = f"Retest <i>— no qualifying {tf} break to retest</i>"
             break
         if not tl_break_pass and best_near is not None:
             tf_n, beyond_n, lv_n, _ = best_near
