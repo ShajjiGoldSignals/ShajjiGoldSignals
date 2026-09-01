@@ -11,7 +11,7 @@
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4327.79034,
+  "last_seen_price": 4328.0113,
   "last_heartbeat_date": "2026-09-01",
   "last_warn_ms": 1788243020187.8271,
   "counters": {
@@ -100,5 +100,5 @@
       "fired": 0
     }
   },
-  "last_scan_ms": 1788294020210
+  "last_scan_ms": 1788294320674
 }
