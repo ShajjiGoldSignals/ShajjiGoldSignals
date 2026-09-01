@@ -41,6 +41,14 @@ LINE_ACTIVITY_WINDOW_CANDLES = 100   # last touch/break must be within this many
 LINE_SPENT_ATR = 4.0                 # if price ever went >4x ATR beyond the line, it's spent forever
 # --- bounce scoring: how many candles after a touch to measure the reaction ---
 BOUNCE_MEASURE_CANDLES = 6
+# --- RSI divergence relevance: how far the newest swing may sit from current price ---
+# Always measured against ATR(5m), on every timeframe, because the yardstick that matters
+# is the trade being entered now (SL/TP are 2x ATR(5m)), not the chart the swing was drawn
+# on. Before this, divergence was the ONLY structural check with no distance filter: a
+# trendline 10x ATR from price is discarded as irrelevant, yet a divergence 10x ATR away
+# still counted as a full core condition. Wider allowance on higher timeframes because
+# their swings are naturally further apart. 30m is confluence-only, so it is the loosest.
+DIVERGENCE_MAX_DISTANCE_ATR = {5: 2.0, 15: 8.0, 30: 12.0}
 MAX_LINE_DISTANCE_USD = 30  # a trendline projecting further than this from current price is treated as stale/unreliable
 # session windows in PKT: (start_hour,start_min,end_hour,end_min)
 SESSION_WINDOWS = [(7, 0, 16, 0), (20, 0, 23, 0)]
@@ -65,7 +73,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ============================= TWELVE DATA (primary source) =============================
 TD_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 TD_SYMBOL = "XAU/USD"          # spot gold - same instrument MT5 shows, not futures
-TD_OUTPUTSIZE = 1500           # 1500 x 5m candles is about 5 days of history
+TD_OUTPUTSIZE = 5000           # API maximum. Costs the SAME 1 credit as 1500 - TwelveData
+                               # bills per request, not per candle - but gives ~17 days of
+                               # history instead of ~5. That deepens the 1H swing pool for
+                               # S&R clustering from ~125 to ~416 candles. Trendline windows
+                               # are fixed constants and do NOT grow with this, which is what
+                               # keeps the O(window^3) fitting cost unchanged.
 
 
 def fetch_twelvedata_5m():
@@ -639,19 +652,46 @@ def detect_line_strike(candles):
 
 
 # ============================= RSI DIVERGENCE =============================
-def detect_divergence(candles, rsi_vals):
+def detect_divergence(candles, rsi_vals, price=None, atr_val=None,
+                      max_distance_atr=None):
     """Detect regular/hidden RSI divergence.
 
     Also returns the exact swing prices and RSI readings that were compared, so the
     Telegram message can show the real evidence rather than just asserting a result.
     Shape: {"bullish": kind|None, "bearish": kind|None, "bullish_detail": {...}, ...}
+
+    RELEVANCE FILTER: a divergence describes momentum AT a swing point. Once price has
+    travelled far from that swing, the reading no longer describes the market about to be
+    traded. When price/atr_val/max_distance_atr are supplied, a divergence whose NEWEST
+    swing sits further than max_distance_atr x ATR from price is rejected. The detail is
+    still returned with rejected=True, so the message can report the miss as a number
+    rather than falsely claiming no divergence existed.
+
+    With those arguments omitted the behaviour is unchanged, so callers that do not care
+    about distance (diagnostics) still work exactly as before.
     """
     highs, lows = find_swings(candles, 3)
     result = {"bullish": None, "bearish": None,
               "bullish_detail": None, "bearish_detail": None}
 
+    limit = None
+    if price is not None and atr_val and atr_val > 0 and max_distance_atr:
+        limit = max_distance_atr * atr_val
+
     def rsi_at(i):
         return rsi_vals[i] if i < len(rsi_vals) else None
+
+    def build(s1, s2, kind):
+        det = {"p1": s1["price"], "p2": s2["price"],
+               "r1": rsi_at(s1["i"]), "r2": rsi_at(s2["i"]),
+               "kind": kind, "rejected": False, "dist": None, "dist_atr": None}
+        if price is not None:
+            det["dist"] = abs(price - s2["price"])
+            if atr_val and atr_val > 0:
+                det["dist_atr"] = det["dist"] / atr_val
+            if limit is not None and det["dist"] > limit:
+                det["rejected"] = True
+        return det
 
     if len(highs) >= 2:
         h1, h2 = highs[-2], highs[-1]
@@ -663,10 +703,10 @@ def detect_divergence(candles, rsi_vals):
             elif h2["price"] < h1["price"] and r2 > r1:
                 kind = "hidden"
             if kind:
-                result["bearish"] = kind
-                result["bearish_detail"] = {
-                    "p1": h1["price"], "p2": h2["price"], "r1": r1, "r2": r2,
-                }
+                det = build(h1, h2, kind)
+                result["bearish_detail"] = det
+                if not det["rejected"]:
+                    result["bearish"] = kind
     if len(lows) >= 2:
         l1, l2 = lows[-2], lows[-1]
         r1, r2 = rsi_at(l1["i"]), rsi_at(l2["i"])
@@ -677,10 +717,10 @@ def detect_divergence(candles, rsi_vals):
             elif l2["price"] > l1["price"] and r2 < r1:
                 kind = "hidden"
             if kind:
-                result["bullish"] = kind
-                result["bullish_detail"] = {
-                    "p1": l1["price"], "p2": l2["price"], "r1": r1, "r2": r2,
-                }
+                det = build(l1, l2, kind)
+                result["bullish_detail"] = det
+                if not det["rejected"]:
+                    result["bullish"] = kind
     return result
 
 
@@ -697,6 +737,17 @@ def in_session_window(now_utc):
         if h1 * 60 + m1 <= mins <= h2 * 60 + m2:
             return True
     return False
+
+
+def market_is_open(now_utc):
+    """Spot gold trades from ~Sunday 22:00 UTC to ~Friday 21:00 UTC.
+
+    In PKT (UTC+5) that reopens Monday 03:00 - before the 07:00 session - and closes
+    Saturday ~02:00, after the Friday 20:00-23:00 session has finished. So every PKT
+    Saturday and Sunday falls entirely inside the weekend close, with no edge cases
+    against the session windows. Scanning then just re-fetches frozen candles.
+    """
+    return (now_utc + timedelta(hours=5)).weekday() < 5  # Mon=0 .. Fri=4
 
 
 # ============================= SIGNAL ENGINE =============================
@@ -750,9 +801,12 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
     nearest_sup = max((v for v in supports if v < price), default=None)
 
     strike_type, strike_rev, strike_detail = detect_line_strike(candles5)
-    div5 = detect_divergence(candles5, rsi5)
-    div15 = detect_divergence(candles15, rsi15)
-    div30 = detect_divergence(candles30, rsi30)
+    div5 = detect_divergence(candles5, rsi5, price=price, atr_val=atr5,
+                             max_distance_atr=DIVERGENCE_MAX_DISTANCE_ATR[5])
+    div15 = detect_divergence(candles15, rsi15, price=price, atr_val=atr5,
+                              max_distance_atr=DIVERGENCE_MAX_DISTANCE_ATR[15])
+    div30 = detect_divergence(candles30, rsi30, price=price, atr_val=atr5,
+                              max_distance_atr=DIVERGENCE_MAX_DISTANCE_ATR[30])
 
     real_in_session = in_session_window(now_utc)
     in_session = real_in_session or bypass_session
@@ -859,7 +913,9 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
                 if det:
                     core_hits.append(
                         f"{label} {d[want_key]} · price <code>{det['p1']:.2f}→{det['p2']:.2f}</code> "
-                        f"vs RSI <code>{det['r1']:.1f}→{det['r2']:.1f}</code>")
+                        f"vs RSI <code>{det['r1']:.1f}→{det['r2']:.1f}</code>"
+                        + (f" · <code>{det['dist_atr']:.1f}x</code> ATR away"
+                           if det.get("dist_atr") is not None else ""))
                 else:
                     core_hits.append(f"{label} {d[want_key]}")
         if core_hits:
@@ -867,7 +923,24 @@ def evaluate(candles5, candles15, candles30, candles60, now_utc, bypass_session=
             for extra in core_hits[1:]:
                 div_desc += f"\n      <i>+ {extra}</i>"
         else:
-            div_desc = "RSI divergence <i>— none supporting this direction</i>"
+            # A divergence that WAS found but sat too far from price is reported with the
+            # real distance, so a near miss never looks like "nothing happened".
+            too_far = []
+            for label, d, tf in (("5m", div5, 5), ("15m", div15, 15)):
+                det = d.get(f"{want_key}_detail")
+                if det and det.get("rejected"):
+                    lim = DIVERGENCE_MAX_DISTANCE_ATR[tf] * atr5 if atr5 else 0
+                    too_far.append(
+                        f"{label} {det['kind']} · swing <code>{det['p2']:.2f}</code> is "
+                        f"<code>${det['dist']:.2f}</code> "
+                        f"(<code>{det['dist_atr']:.1f}x</code> ATR) from price "
+                        f"— <b>max ${lim:.2f}</b>")
+            if too_far:
+                div_desc = "RSI divergence · too far to count — " + too_far[0]
+                for extra in too_far[1:]:
+                    div_desc += f"\n      <i>+ {extra}</i>"
+            else:
+                div_desc = "RSI divergence <i>— none supporting this direction</i>"
         conds.append(("divergence", div_desc, len(core_hits) > 0))
 
         # ============= CONFLUENCE (30m trendline + 1H S&R) - bonus only =============
@@ -1575,6 +1648,13 @@ def main():
     is_manual_run = (os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
                      and scan_iteration == "1")
 
+    # Weekend: the market is shut, so no candle can change and no trade can hit TP/SL.
+    # Exit 0 (not an error) so run_loop.sh still pings healthchecks.io and the monitor
+    # stays green through the weekend instead of alerting every 30 minutes.
+    if not market_is_open(now_utc) and not is_manual_run:
+        print("Gold market closed for the weekend (PKT). Skipping scan.")
+        return
+
     in_session = in_session_window(now_utc)
     state_store = load_state()
     roll_today_if_new_day(state_store, now_utc)
@@ -1614,13 +1694,10 @@ def main():
 
     print(f"  data source: {source}")
 
-    # True real-time price. Falls back to the newest candle close only if the quote
-    # endpoint is unavailable, so a failure here never blocks a scan.
-    if source == "twelvedata":
-        live = fetch_twelvedata_price()
-        if live is not None:
-            spot = {"spot_usd_oz": live, "is_realtime": True}
-            print(f"  live quote: {live:.2f}")
+    # Live quote is display-only and is NOT fetched here any more. Calling it every
+    # scan burned ~288 credits/day and exhausted the free quota by mid-afternoon. It is
+    # now fetched only when a message will actually be sent (see below). The decision is
+    # made on the last CLOSED candle either way, so detection is completely unchanged.
     if raw5 and not spot:
         spot = {"spot_usd_oz": raw5[-1]["c"]}
 
@@ -1713,6 +1790,17 @@ def main():
 
     last_state = state_store.get("last_state", "NONE")
     current_state = res.get("state")
+
+    # Fetch the real-time quote ONLY when this scan will actually send a message.
+    # Display-only: it never feeds evaluate(), so skipping it cannot miss a signal.
+    will_notify = is_manual_run or (
+        current_state in ("BUY", "SELL", "PRE_BUY", "PRE_SELL")
+        and current_state != last_state)
+    if will_notify and source == "twelvedata":
+        live = fetch_twelvedata_price()
+        if live is not None:
+            res["live_spot"] = live
+            print(f"  live quote: {live:.2f}")
 
     if is_manual_run:
         # Manual/demo run: render EXACTLY what a real signal would look like - risky label,
