@@ -4,24 +4,14 @@
   "signal_counter": 0,
   "tp_hits": 0,
   "sl_hits": 0,
-  "pending_trades": [
-    {
-      "signal_number": 50,
-      "dir": "SELL",
-      "kind": "pre",
-      "entry": 4347.93318,
-      "sl": 4358.193424101476,
-      "tp": 4337.672935898524,
-      "opened_at_ms": 1788282320357
-    }
-  ],
+  "pending_trades": [],
   "risky_counter": 0,
   "risky_tp_hits": 0,
   "risky_sl_hits": 0,
   "pre_counter": 1,
   "pre_tp_hits": 1,
   "pre_sl_hits": 0,
-  "last_seen_price": 4344.84893,
+  "last_seen_price": 4340.15851,
   "last_heartbeat_date": "2026-09-01",
   "last_warn_ms": 1788276570329.927,
   "counters": {
@@ -64,7 +54,7 @@
           1
         ],
         "pre": [
-          20,
+          21,
           6
         ]
       }
@@ -102,7 +92,7 @@
           0
         ],
         "pre": [
-          7,
+          8,
           1
         ]
       },
@@ -110,5 +100,5 @@
       "fired": 14
     }
   },
-  "last_scan_ms": 1788285920757
+  "last_scan_ms": 1788286858173
 }
